@@ -1,0 +1,32 @@
+[
+  {
+    "measure_name": "Sales Amount",
+    "description": "The total monetary value of all sales transactions. This is a key measure for a store's financial performance.",
+    "dax_formula": "SUM('SalesFact'[SalesAmount])",
+    "aliases": [
+      "sales",
+      "sales revenue",
+      "total sales",
+      "store sales"
+    ]
+  },
+  {
+    "measure_name": "Traffic Conversion",
+    "description": "Calculated as Total Sales Transactions divided by Total Store Visits.",
+    "dax_formula": "[Total Transactions] / [Store Visits]",
+    "aliases": [
+      "conversion rate",
+      "traffic to sales",
+      "customer conversion"
+    ]
+  },
+  {
+    "measure_name": "Average Basket Size",
+    "description": "Average number of items sold per transaction.",
+    "dax_formula": "[Total Items Sold] / [Total Transactions]",
+    "aliases": [
+      "avg items",
+      "basket size"
+    ]
+  }
+]
