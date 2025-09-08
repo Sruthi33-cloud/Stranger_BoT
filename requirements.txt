@@ -2,3 +2,4 @@ azure-functions
 botbuilder-core==4.17.0
 botbuilder-azure==4.17.0
 aiohttp==3.9.0
+cryptography==43.0.3
