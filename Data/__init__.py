@@ -2,6 +2,7 @@ import logging
 import os
 import json
 import azure.functions as func
+import sys
 
 # Bot Framework SDK Libraries
 from botbuilder.core import BotFrameworkAdapter, BotFrameworkAdapterSettings, TurnContext
@@ -373,3 +374,4 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
             "An error occurred while processing the request.",
             status_code=500
         )
+
