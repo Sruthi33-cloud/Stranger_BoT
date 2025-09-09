@@ -8,7 +8,7 @@ import asyncio
 # Bot Framework SDK Libraries
 from botbuilder.core import BotFrameworkAdapter, BotFrameworkAdapterSettings, TurnContext
 from botbuilder.schema import Activity, ActivityTypes
-from botframework.connector.auth import MicrosoftAppCredentials # ADDED THIS IMPORT
+from botframework.connector.auth import MicrosoftAppCredentials
 
 import pandas as pd
 import requests
@@ -90,8 +90,6 @@ def load_knowledge_base():
 KNOWLEDGE_BASE_DATA = load_knowledge_base()
 
 # --- Snowflake Connection & Data Utilities ---
-# ... (all your other functions like get_rbac_table, get_sales_territory_keys, etc. remain the same) ...
-
 def get_rbac_table(conn):
     print("Fetching RBAC table from Snowflake...") # DEBUG
     query = "SELECT USERNAME, ROLE, LOCATION_ID FROM ENTERPRISE.RETAIL_DATA.RBAC_WORK_TABLE"
@@ -157,7 +155,7 @@ def get_metric_value(conn, measure, store_id, location_to_territory_map):
             df_sales = cur.fetch_pandas_all()
             cur.close()
             df_sales.columns = df_sales.columns.str.lower()
-            total_sales = df_sales['total_sales_amount'][0] if not df_sales.empty else 0
+            total_sales = df_sales['total_sales_amount'][0] if not df_sales.empty and not df_sales['total_sales_amount'].isnull().iloc[0] else 0.0
             print(f"Fetched total sales amount: {total_sales}") # DEBUG
             return {"Sales Amount": total_sales}
         except Exception as e:
@@ -245,17 +243,17 @@ def call_azure_openai(prompt, temperature=0.7, max_tokens=500):
 
 # --- The Core Bot Logic Handler ---
 async def message_handler(turn_context: TurnContext):
-    print("Entered message_handler...") # DEBUG
-    try:
-        user_query = turn_context.activity.text
-        print(f"user_query: {user_query}") # DEBUG
-        teams_user_id = turn_context.activity.from_property.id
-        print(f"teams_user_id: {teams_user_id}") # DEBUG
-        final_answer = ""
-        conn = None
+    print("Entered message_handler...")
+    user_query = turn_context.activity.text
+    print(f"user_query: {user_query}")
+    teams_user_id = turn_context.activity.from_property.id
+    print(f"teams_user_id: {teams_user_id}")
+    final_answer = ""
+    conn = None
 
+    try:
         try:
-            print("Connecting to Snowflake...") # DEBUG
+            print("Connecting to Snowflake...")
             conn = snowflake.connector.connect(
                 user=SNOWFLAKE_USER,
                 password=SNOWFLAKE_PASSWORD,
@@ -264,44 +262,51 @@ async def message_handler(turn_context: TurnContext):
                 database=SNOWFLAKE_DATABASE,
                 schema=SNOWFLAKE_SCHEMA
             )
-            print("Connected to Snowflake.") # DEBUG
+            print("Connected to Snowflake.")
+        except Exception as e:
+            print(f"Snowflake Connection Error: {e}")
+            final_answer = "Sorry, I'm unable to connect to the data source right now. Please try again later."
+            await turn_context.send_activity(Activity(text=final_answer, type=ActivityTypes.message))
+            return # Exit if connection fails
 
+        try:
+            print("Fetching RBAC and Territory Data from Snowflake...")
             rbac_df = get_rbac_table(conn)
             territory_keys = get_sales_territory_keys(conn)
             location_to_territory_map = create_location_to_territory_mapping(rbac_df, territory_keys)
+            print("Successfully fetched RBAC and Territory data.")
+        except Exception as e:
+            print(f"Error fetching Snowflake data: {e}")
+            final_answer = "Sorry, there was an issue retrieving user access data. Please contact support."
+            await turn_context.send_activity(Activity(text=final_answer, type=ActivityTypes.message))
+            return # Exit if data fetching fails
 
-            # --- MODIFIED SECTION FOR WEB CHAT TESTING ---
-            # Allow Web Chat and fallback users to use RBAC
-            rbac_user_id = None
+        # --- HIGHLIGHT: Replaced the user_id_mapping with a static user for testing ---
+        rbac_user_id = "victor"
+        print("Using static RBAC user_id for testing:", rbac_user_id)
 
-            # Try to use Teams ID mapping, else fallback for web chat
-            user_id_mapping = {
-                "29:1f77d853-90d5-4554-b5b5-f55e5898d9c5": "saisri", # Example Teams ID for user 'saisri'
-                "29:1ab25dc4-3300-4e8f-a458-167606ced5b3": "denise" # Example Teams ID for user 'denise'
-            }
+        access = get_user_access(rbac_user_id, rbac_df)
+        print(f"access: {access}")
 
-            # CHANGE: The user_id from Web Chat is typically in the format '1ab25dc4-3300-4e8f-a458-167606ced5b3',
-            # so the mapping needs to reflect that. I've updated the mapping for 'denise' to match the user_id in your logs.
-            rbac_user_id = user_id_mapping.get(teams_user_id, None)
-
-            # If unmapped, fallback to a default RBAC user for testing
-            if not rbac_user_id:
-                # Use any valid USER_ID from your RBAC table for test (e.g. "denise")
-                rbac_user_id = "denise"
-                print("Falling back to RBAC user_id for web chat testing:", rbac_user_id)
-
-            access = get_user_access(rbac_user_id, rbac_df)
-            print(f"access: {access}") # DEBUG
-
-            if not access:
-                print("Access information not found in RBAC table.") # DEBUG
-                final_answer = "Sorry, your access information could not be found in the RBAC table."
-            else:
+        if not access:
+            print("Access information not found in RBAC table.")
+            final_answer = "Sorry, your access information could not be found in the RBAC table."
+        else:
+            try:
+                print("Calling find_measure_with_llm...")
                 measure = find_measure_with_llm(user_query, KNOWLEDGE_BASE_DATA)
-                print(f"measure: {measure}") # DEBUG
-                if measure:
+                print(f"measure: {measure}")
+            except Exception as e:
+                print(f"Error in find_measure_with_llm: {e}")
+                final_answer = "Sorry, I'm having trouble understanding your request right now."
+                await turn_context.send_activity(Activity(text=final_answer, type=ActivityTypes.message))
+                return # Exit if LLM call fails
+
+            if measure:
+                try:
+                    print("Calling get_metric_value...")
                     sf_data = get_metric_value(conn, measure, access['store_id'], location_to_territory_map)
-                    print(f"sf_data: {sf_data}") # DEBUG
+                    print(f"sf_data: {sf_data}")
                     llm_prompt = build_llm_prompt(
                         {"user_id": rbac_user_id},
                         access,
@@ -310,46 +315,46 @@ async def message_handler(turn_context: TurnContext):
                         sf_data=sf_data,
                         location_to_territory_map=location_to_territory_map
                     )
-                    print(f"llm_prompt: {llm_prompt[:200]}...") # DEBUG
+                    print(f"llm_prompt: {llm_prompt[:200]}...")
+                    
+                    print("Calling call_azure_openai...")
                     final_answer = call_azure_openai(llm_prompt)
-                    print(f"final_answer: {final_answer}") # DEBUG
-                else:
-                    print("Measure not found.") # DEBUG
-                    final_answer = "Sorry, I can't find that measure. Please ask about sales, traffic, or basket size."
-
-        except Exception as e:
-            print(f"Error processing bot request inner: {e}") # DEBUG
-            final_answer = "Sorry, an internal error occurred while processing your request. Please try again later."
-        finally:
-            if conn:
-                conn.close()
-                print("Snowflake connection closed.") # DEBUG
-
-        await turn_context.send_activity(Activity(text=final_answer, type=ActivityTypes.message))
-        print("Activity sent to bot.") # DEBUG
-
+                    print(f"final_answer: {final_answer}")
+                except Exception as e:
+                    print(f"Error getting metric value or calling Azure OpenAI: {e}")
+                    final_answer = "Sorry, an internal error occurred while retrieving and processing your data."
+            else:
+                print("Measure not found.")
+                final_answer = "Sorry, I can't find that measure. Please ask about sales, traffic, or basket size."
+            
     except Exception as e:
-        print(f"Error in message_handler outer: {e}") # DEBUG
+        # This is the outer catch-all. If this is hit, something unexpected happened.
+        print(f"Unhandled error in message_handler outer: {e}")
+        final_answer = "Sorry, an internal error occurred while processing your request. Please try again later."
+    finally:
+        if conn:
+            conn.close()
+            print("Snowflake connection closed.")
+
+    await turn_context.send_activity(Activity(text=final_answer, type=ActivityTypes.message))
+    print("Activity sent to bot.")
+
 
 # --- The Main Azure Functions Entry Point ---
 def main(req: func.HttpRequest) -> func.HttpResponse:
     print('Python HTTP trigger function received a request.') # DEBUG
 
-    # HIGHLIGHT: Handle GET requests for health checks.
     if req.method == 'GET':
         return func.HttpResponse("Bot endpoint is healthy", status_code=200)
 
-    # HIGHLIGHT: Check for POST requests.
     if req.method != 'POST':
         return func.HttpResponse("Only POST requests are supported for bot messages.", status_code=405)
 
     try:
-        # HIGHLIGHT: Use get_json() to parse the request body.
         req_json = req.get_json()
         print(f"Request JSON: {req_json}") # DEBUG
 
     except ValueError:
-        # HIGHLIGHT: Handle non-JSON requests gracefully.
         print("HTTP request does not contain valid JSON data. This may be a non-bot request.")
         return func.HttpResponse(
             "Please pass a valid JSON activity in the request body.",
@@ -362,18 +367,15 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
             status_code=500
         )
 
-    # HIGHLIGHT: Deserialize the raw JSON body into an Activity object.
     activity = Activity.deserialize(req_json)
     auth_header = req.headers.get('Authorization') or req.headers.get('authorization') or ''
 
-    # We will now create the adapter dynamically for each request
     APP_ID = os.environ.get("MicrosoftAppId", "")
     APP_PASSWORD = os.environ.get("MicrosoftAppPassword", "")
     APP_TYPE = os.environ.get("MicrosoftAppType", "")
     APP_TENANT_ID = os.environ.get("MicrosoftAppTenantId", "")
 
     try:
-        # Use custom credentials for single-tenant
         if APP_TYPE == "SingleTenant" and APP_TENANT_ID:
             credentials = SingleTenantAppCredentials(APP_ID, APP_PASSWORD, APP_TENANT_ID)
             print("Using SingleTenantAppCredentials")
@@ -386,7 +388,6 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
             app_password=APP_PASSWORD
         )
 
-        # Override OAuth endpoint for single-tenant
         if APP_TYPE == "SingleTenant" and APP_TENANT_ID:
             settings.oauth_endpoint = f"https://login.microsoftonline.com/{APP_TENANT_ID}"
             print(f"Set OAuth authority to: {settings.oauth_endpoint}")
@@ -400,16 +401,14 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
         print(f"Failed to create adapter: {adapter_error}")
         return func.HttpResponse("Adapter creation failed.", status_code=500)
 
-    # Process the activity using the correctly formatted arguments
     try:
         asyncio_loop = asyncio.new_event_loop()
         asyncio.set_event_loop(asyncio_loop)
 
-        # HIGHLIGHT: Pass the Activity object and the Authorization header string.
         response = asyncio_loop.run_until_complete(
             adapter.process_activity(
-                activity,  # <--- Pass the deserialized Activity object
-                auth_header, # <--- Pass the Authorization header string
+                activity,
+                auth_header,
                 message_handler
             )
         )
