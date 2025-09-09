@@ -35,8 +35,10 @@ jobs:
 
       - name: Install dependencies
         run: |
-          # --- CORRECTED LINE: REMOVED '--no-binary cryptography' ---
+          python -m venv .venv
+          source .venv/bin/activate
           pip install --target=".python_packages/lib/site-packages" -r ./requirements.txt
+
       - name: Login to Azure
         uses: azure/login@v2
         with:
