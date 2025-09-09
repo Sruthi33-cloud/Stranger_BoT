@@ -58,7 +58,6 @@ print(f"AZURE_OPENAI_KEY: {bool(AZURE_OPENAI_KEY)}, AZURE_OPENAI_ENDPOINT: {AZUR
 print(f"SNOWFLAKE_USER: {SNOWFLAKE_USER}, SNOWFLAKE_ACCOUNT: {SNOWFLAKE_ACCOUNT}") # DEBUG
 
 # --- Initialize the Azure OpenAI Client ---
-# NOTE: Removed the global ADAPTER variable as it's now created inside the main function for each request
 try:
     AZURE_OPENAI_CLIENT = AzureOpenAI(
         api_key=AZURE_OPENAI_KEY,
@@ -166,31 +165,65 @@ def get_metric_value(conn, measure, store_id, location_to_territory_map):
         return {"Traffic Conversion": 0.0}
     return {}
 
+# --- HIGHLIGHT: Refactored function to use a tool for more reliable intent recognition ---
 def find_measure_with_llm(user_query, knowledge_base):
-    print(f"Finding measure with LLM for query: {user_query}") # DEBUG
-    measure_names = [item['measure_name'] for item in knowledge_base]
-    prompt = f"""
-    The user's query is: "{user_query}"
-    Based on the query, identify the most relevant measure from the following list.
-    If a measure is clearly mentioned or implied, respond ONLY with the measure name, nothing else.
-    If no measure is found, respond ONLY with the text "NO_MEASURE_FOUND".
-    Available measures: {', '.join(measure_names)}
-    Example 1:
-    Query: "What is my total sales amount for the month?"
-    Response: Sales Amount
-    Your response for the user's query:
-    """
+    print(f"Finding measure with LLM for query: {user_query}")
+    
+    # 1. Define the tool the LLM can use
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "get_measure",
+                "description": "Get the value of a specific retail measure for a user's store.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "measure_name": {
+                            "type": "string",
+                            "enum": [item['tool_name'] for item in knowledge_base],
+                            "description": "The name of the measure, e.g., 'sales_amount', 'traffic_conversion', 'basket_size'"
+                        }
+                    },
+                    "required": ["measure_name"]
+                }
+            }
+        }
+    ]
+    
+    # 2. Call the LLM with the user's query and the tool definition
     try:
-        identified_measure = call_azure_openai(prompt, temperature=0.0, max_tokens=100)
-        print(f"Identified measure from LLM: {identified_measure}") # DEBUG
-        if identified_measure and identified_measure.strip().replace('.', '').lower() in [m.lower() for m in measure_names]:
+        response = AZURE_OPENAI_CLIENT.chat.completions.create(
+            model=AZURE_OPENAI_DEPLOYMENT_NAME,
+            messages=[
+                {"role": "system", "content": "You are a helpful assistant. If the user asks for a measure, call the appropriate tool."},
+                {"role": "user", "content": user_query}
+            ],
+            tools=tools,
+            tool_choice="auto", # Let the model decide whether to call the tool
+            temperature=0.0
+        )
+        
+        # 3. Check if the LLM chose to call the tool
+        tool_calls = response.choices[0].message.tool_calls
+        if tool_calls:
+            function_call = tool_calls[0].function
+            function_name = function_call.name
+            arguments = json.loads(function_call.arguments)
+            tool_measure_name = arguments.get("measure_name")
+            
+            print(f"LLM called function: {function_name} with measure: {tool_measure_name}")
+            
+            # 4. Find the full measure object from our knowledge base
             for measure in knowledge_base:
-                if measure['measure_name'].lower() == identified_measure.strip().replace('.', '').lower():
-                    print(f"Returning found measure: {measure}") # DEBUG
+                if measure['tool_name'] == tool_measure_name:
+                    print(f"Returning found measure: {measure}")
                     return measure
+    
     except Exception as e:
-        print(f"Error during LLM intent recognition: {e}") # DEBUG
-    print("No measure found.") # DEBUG
+        print(f"Error during LLM tool-calling: {e}")
+        
+    print("No measure found via tool-calling.")
     return None
 
 def build_llm_prompt(user, access, user_query, measure, sf_data=None, location_to_territory_map=None):
@@ -245,10 +278,9 @@ def call_azure_openai(prompt, temperature=0.7, max_tokens=500):
 async def message_handler(turn_context: TurnContext):
     print("Entered message_handler...")
     
-    # --- HIGHLIGHT: Add this check to only process 'message' activities ---
     if turn_context.activity.type != ActivityTypes.message:
         print(f"Ignoring activity of type: {turn_context.activity.type}")
-        return # Exit the function for any non-message activity
+        return
     
     user_query = turn_context.activity.text
     print(f"user_query: {user_query}")
@@ -273,7 +305,7 @@ async def message_handler(turn_context: TurnContext):
             print(f"Snowflake Connection Error: {e}")
             final_answer = "Sorry, I'm unable to connect to the data source right now. Please try again later."
             await turn_context.send_activity(Activity(text=final_answer, type=ActivityTypes.message))
-            return # Exit if connection fails
+            return
 
         try:
             print("Fetching RBAC and Territory Data from Snowflake...")
@@ -285,9 +317,8 @@ async def message_handler(turn_context: TurnContext):
             print(f"Error fetching Snowflake data: {e}")
             final_answer = "Sorry, there was an issue retrieving user access data. Please contact support."
             await turn_context.send_activity(Activity(text=final_answer, type=ActivityTypes.message))
-            return # Exit if data fetching fails
+            return
 
-        # --- HIGHLIGHT: Replaced the user_id_mapping with a static user for testing ---
         rbac_user_id = "victor"
         print("Using static RBAC user_id for testing:", rbac_user_id)
 
@@ -334,7 +365,6 @@ async def message_handler(turn_context: TurnContext):
                 final_answer = "Sorry, I can't find that measure. Please ask about sales, traffic, or basket size."
             
     except Exception as e:
-        # This is the outer catch-all. If this is hit, something unexpected happened.
         print(f"Unhandled error in message_handler outer: {e}")
         final_answer = "Sorry, an internal error occurred while processing your request. Please try again later."
     finally:
