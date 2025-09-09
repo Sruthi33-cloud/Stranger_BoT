@@ -277,9 +277,11 @@ async def message_handler(turn_context: TurnContext):
             # Try to use Teams ID mapping, else fallback for web chat
             user_id_mapping = {
                 "29:1f77d853-90d5-4554-b5b5-f55e5898d9c5": "saisri", # Example Teams ID for user 'saisri'
-                "29:1a2b3c4d-5e6f-7a8b-9c0d-1e2f3a4b5c6d": "dev" # Example Teams ID for user 'dev'
+                "29:1ab25dc4-3300-4e8f-a458-167606ced5b3": "denise" # Example Teams ID for user 'denise'
             }
 
+            # CHANGE: The user_id from Web Chat is typically in the format '1ab25dc4-3300-4e8f-a458-167606ced5b3',
+            # so the mapping needs to reflect that. I've updated the mapping for 'denise' to match the user_id in your logs.
             rbac_user_id = user_id_mapping.get(teams_user_id, None)
 
             # If unmapped, fallback to a default RBAC user for testing
@@ -333,76 +335,97 @@ async def message_handler(turn_context: TurnContext):
 def main(req: func.HttpRequest) -> func.HttpResponse:
     print('Python HTTP trigger function received a request.') # DEBUG
 
+    # HIGHLIGHT: Handle GET requests for health checks.
+    if req.method == 'GET':
+        return func.HttpResponse("Bot endpoint is healthy", status_code=200)
+
+    # HIGHLIGHT: Check for POST requests.
+    if req.method != 'POST':
+        return func.HttpResponse("Only POST requests are supported for bot messages.", status_code=405)
+
     try:
-        # We will now create the adapter dynamically for each request
-        APP_ID = os.environ.get("MicrosoftAppId", "")
-        APP_PASSWORD = os.environ.get("MicrosoftAppPassword", "")
-        APP_TYPE = os.environ.get("MicrosoftAppType", "")
-        APP_TENANT_ID = os.environ.get("MicrosoftAppTenantId", "")
+        # HIGHLIGHT: Use get_json() to parse the request body.
+        req_json = req.get_json()
+        print(f"Request JSON: {req_json}") # DEBUG
 
-        try:
-            # Use custom credentials for single-tenant
-            if APP_TYPE == "SingleTenant" and APP_TENANT_ID:
-                credentials = SingleTenantAppCredentials(APP_ID, APP_PASSWORD, APP_TENANT_ID)
-                print("Using SingleTenantAppCredentials")
-            else:
-                credentials = MicrosoftAppCredentials(APP_ID, APP_PASSWORD)
-                print("Using standard MicrosoftAppCredentials")
-
-            settings = BotFrameworkAdapterSettings(
-                app_id=APP_ID,
-                app_password=APP_PASSWORD
-            )
-
-            # Override OAuth endpoint for single-tenant
-            if APP_TYPE == "SingleTenant" and APP_TENANT_ID:
-                settings.oauth_endpoint = f"https://login.microsoftonline.com/{APP_TENANT_ID}"
-                print(f"Set OAuth authority to: {settings.oauth_endpoint}")
-
-            adapter = BotFrameworkAdapter(settings)
-            adapter._credentials = credentials
-            
-            print("Adapter created.")
-
-        except Exception as adapter_error:
-            print(f"Failed to create adapter: {adapter_error}")
-            return func.HttpResponse("Adapter creation failed.", status_code=500)
-
-        # Process the request
-        try:
-            req_json = req.get_json()
-            auth_header = req.headers.get('Authorization') or req.headers.get('authorization') or ''
-
-            asyncio_loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(asyncio_loop)
-
-            response = asyncio_loop.run_until_complete(
-                adapter.process_activity(
-                    req_json,
-                    req.headers.get('Authorization'),
-                    message_handler
-                )
-            )
-
-            if response:
-                return func.HttpResponse(
-                    body=response.body,
-                    mimetype=response.content_type,
-                    status_code=response.status
-                )
-            else:
-                return func.HttpResponse(status_code=202)
-
-        except Exception as process_error:
-            print(f"Error processing bot request: {process_error}")
-            return func.HttpResponse(
-                "An error occurred while processing the request.",
-                status_code=500
-            )
-
-    except Exception as error:
-        print(f"Unhandled error in main: {error}")
+    except ValueError:
+        # HIGHLIGHT: Handle non-JSON requests gracefully.
+        print("HTTP request does not contain valid JSON data. This may be a non-bot request.")
         return func.HttpResponse(
-            "Internal server error.",
+            "Please pass a valid JSON activity in the request body.",
+            status_code=400
+        )
+    except Exception as error:
+        print(f"Failed to get JSON from request: {error}")
+        return func.HttpResponse(
+            f"An error occurred while parsing the request body: {error}",
+            status_code=500
+        )
+
+    # HIGHLIGHT: Deserialize the raw JSON body into an Activity object.
+    activity = Activity.deserialize(req_json)
+    auth_header = req.headers.get('Authorization') or req.headers.get('authorization') or ''
+
+    # We will now create the adapter dynamically for each request
+    APP_ID = os.environ.get("MicrosoftAppId", "")
+    APP_PASSWORD = os.environ.get("MicrosoftAppPassword", "")
+    APP_TYPE = os.environ.get("MicrosoftAppType", "")
+    APP_TENANT_ID = os.environ.get("MicrosoftAppTenantId", "")
+
+    try:
+        # Use custom credentials for single-tenant
+        if APP_TYPE == "SingleTenant" and APP_TENANT_ID:
+            credentials = SingleTenantAppCredentials(APP_ID, APP_PASSWORD, APP_TENANT_ID)
+            print("Using SingleTenantAppCredentials")
+        else:
+            credentials = MicrosoftAppCredentials(APP_ID, APP_PASSWORD)
+            print("Using standard MicrosoftAppCredentials")
+
+        settings = BotFrameworkAdapterSettings(
+            app_id=APP_ID,
+            app_password=APP_PASSWORD
+        )
+
+        # Override OAuth endpoint for single-tenant
+        if APP_TYPE == "SingleTenant" and APP_TENANT_ID:
+            settings.oauth_endpoint = f"https://login.microsoftonline.com/{APP_TENANT_ID}"
+            print(f"Set OAuth authority to: {settings.oauth_endpoint}")
+
+        adapter = BotFrameworkAdapter(settings)
+        adapter._credentials = credentials
+        
+        print("Adapter created.")
+
+    except Exception as adapter_error:
+        print(f"Failed to create adapter: {adapter_error}")
+        return func.HttpResponse("Adapter creation failed.", status_code=500)
+
+    # Process the activity using the correctly formatted arguments
+    try:
+        asyncio_loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(asyncio_loop)
+
+        # HIGHLIGHT: Pass the Activity object and the Authorization header string.
+        response = asyncio_loop.run_until_complete(
+            adapter.process_activity(
+                activity,  # <--- Pass the deserialized Activity object
+                auth_header, # <--- Pass the Authorization header string
+                message_handler
+            )
+        )
+
+        if response:
+            return func.HttpResponse(
+                body=response.body,
+                mimetype=response.content_type,
+                status_code=response.status
+            )
+        else:
+            return func.HttpResponse(status_code=202)
+
+    except Exception as process_error:
+        print(f"Error processing bot request: {process_error}")
+        return func.HttpResponse(
+            "An error occurred while processing the request.",
             status_code=500
         )
