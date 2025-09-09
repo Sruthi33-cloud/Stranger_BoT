@@ -329,6 +329,13 @@ async def message_handler(turn_context: TurnContext):
             print("Access information not found in RBAC table.")
             final_answer = "Sorry, your access information could not be found in the RBAC table."
         else:
+            # HIGHLIGHT: Critical pre-check to prevent a "None" object crash
+            if AZURE_OPENAI_CLIENT is None:
+                print("AZURE_OPENAI_CLIENT is None. Cannot proceed with LLM calls.")
+                final_answer = "Sorry, an internal configuration error with the AI model occurred. Please contact support."
+                await turn_context.send_activity(Activity(text=final_answer, type=ActivityTypes.message))
+                return
+
             try:
                 print("Calling find_measure_with_llm...")
                 measure = find_measure_with_llm(user_query, KNOWLEDGE_BASE_DATA)
