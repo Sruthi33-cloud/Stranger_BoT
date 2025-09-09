@@ -92,7 +92,7 @@ KNOWLEDGE_BASE_DATA = load_knowledge_base()
 # --- Snowflake Connection & Data Utilities ---
 def get_rbac_table(conn):
     print("Fetching RBAC table from Snowflake...") # DEBUG
-    query = "SELECT USERNAME, ROLE, LOCATION_ID FROM ENTERPRISE.RETAIL_DATA.RBAC_WORK_TABLE"
+    query = "SELECT USER_ID, ROLE, STORE_ID FROM ENTERPRISE.RETAIL_DATA.RBAC_WORK_TABLE"
     cur = conn.cursor()
     cur.execute(query)
     df = cur.fetch_pandas_all()
@@ -428,3 +428,4 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
             "An error occurred while processing the request.",
             status_code=500
         )
+
