@@ -3,10 +3,12 @@ import os
 import json
 import azure.functions as func
 import sys
+import asyncio
 
 # Bot Framework SDK Libraries
 from botbuilder.core import BotFrameworkAdapter, BotFrameworkAdapterSettings, TurnContext
 from botbuilder.schema import Activity, ActivityTypes
+from botframework.connector.auth import MicrosoftAppCredentials # ADDED THIS IMPORT
 
 import pandas as pd
 import requests
@@ -14,7 +16,6 @@ import snowflake.connector
 import random
 from openai import AzureOpenAI
 from time import sleep
-import asyncio
 
 # Setup logging
 logger = logging.getLogger("azure")
@@ -24,6 +25,15 @@ formatter = logging.Formatter("[%(levelname)s] %(asctime)s - %(message)s")
 handler.setFormatter(formatter)
 if not logger.hasHandlers():
     logger.addHandler(handler)
+
+# --- NEW: Custom Credentials Class for Single-Tenant ---
+class SingleTenantAppCredentials(MicrosoftAppCredentials):
+    """Custom credentials class that forces single-tenant OAuth endpoint"""
+    def __init__(self, app_id: str, password: str, tenant_id: str):
+        super().__init__(app_id, password)
+        self.tenant_id = tenant_id
+        self.oauth_endpoint = f"https://login.microsoftonline.com/{tenant_id}"
+        print(f"SingleTenantAppCredentials initialized with authority: {self.oauth_endpoint}")
 
 # --- Configuration: Get environment variables from Azure Function App settings ---
 print("Loading environment variables...") # DEBUG
@@ -47,16 +57,8 @@ print(f"APP_ID: {APP_ID}, APP_PASSWORD: {(APP_PASSWORD)}") # DEBUG
 print(f"AZURE_OPENAI_KEY: {bool(AZURE_OPENAI_KEY)}, AZURE_OPENAI_ENDPOINT: {AZURE_OPENAI_ENDPOINT}, AZURE_OPENAI_DEPLOYMENT_NAME: {AZURE_OPENAI_DEPLOYMENT_NAME}") # DEBUG
 print(f"SNOWFLAKE_USER: {SNOWFLAKE_USER}, SNOWFLAKE_ACCOUNT: {SNOWFLAKE_ACCOUNT}") # DEBUG
 
-# --- Initialize the Bot Framework Adapter (MODIFIED) ---
-try:
-    settings = BotFrameworkAdapterSettings(APP_ID, APP_PASSWORD)
-    ADAPTER = BotFrameworkAdapter(settings)
-    print("BotFrameworkAdapter initialized.") # DEBUG
-except Exception as e:
-    print(f"Error initializing BotFrameworkAdapter: {e}") # DEBUG
-    ADAPTER = None
-
 # --- Initialize the Azure OpenAI Client ---
+# NOTE: Removed the global ADAPTER variable as it's now created inside the main function for each request
 try:
     AZURE_OPENAI_CLIENT = AzureOpenAI(
         api_key=AZURE_OPENAI_KEY,
@@ -88,6 +90,8 @@ def load_knowledge_base():
 KNOWLEDGE_BASE_DATA = load_knowledge_base()
 
 # --- Snowflake Connection & Data Utilities ---
+# ... (all your other functions like get_rbac_table, get_sales_territory_keys, etc. remain the same) ...
+
 def get_rbac_table(conn):
     print("Fetching RBAC table from Snowflake...") # DEBUG
     query = "SELECT USERNAME, ROLE, LOCATION_ID FROM ENTERPRISE.RETAIL_DATA.RBAC_WORK_TABLE"
@@ -328,50 +332,77 @@ async def message_handler(turn_context: TurnContext):
 # --- The Main Azure Functions Entry Point ---
 def main(req: func.HttpRequest) -> func.HttpResponse:
     print('Python HTTP trigger function received a request.') # DEBUG
-    try:
-        print("Parsing request JSON...") # DEBUG
-        req_json = req.get_json()
-        print(f"Request JSON: {req_json}") # DEBUG
-    except Exception as e:
-        print(f"Failed to parse request JSON: {e}") # DEBUG
-        req_json = None
-
-    # Check if ADAPTER was successfully initialized
-    if ADAPTER is None:
-        print("BotFrameworkAdapter is not initialized. Check your APP_ID and APP_PASSWORD environment variables.")
-        return func.HttpResponse(
-            "Bot adapter could not be initialized. Check environment variables.",
-            status_code=500
-        )
 
     try:
-        print("Starting asyncio loop...") # DEBUG
-        loop = None
+        # We will now create the adapter dynamically for each request
+        APP_ID = os.environ.get("MicrosoftAppId", "")
+        APP_PASSWORD = os.environ.get("MicrosoftAppPassword", "")
+        APP_TYPE = os.environ.get("MicrosoftAppType", "")
+        APP_TENANT_ID = os.environ.get("MicrosoftAppTenantId", "")
+
         try:
-            loop = asyncio.get_event_loop()
-        except RuntimeError:
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
+            # Use custom credentials for single-tenant
+            if APP_TYPE == "SingleTenant" and APP_TENANT_ID:
+                credentials = SingleTenantAppCredentials(APP_ID, APP_PASSWORD, APP_TENANT_ID)
+                print("Using SingleTenantAppCredentials")
+            else:
+                credentials = MicrosoftAppCredentials(APP_ID, APP_PASSWORD)
+                print("Using standard MicrosoftAppCredentials")
 
-        print("Processing activity...") # DEBUG
-        response = loop.run_until_complete(
-            ADAPTER.process_activity(
-                req_json,
-                req.headers,
-                message_handler
+            settings = BotFrameworkAdapterSettings(
+                app_id=APP_ID,
+                app_password=APP_PASSWORD
             )
-        )
-        print("Activity processed.") # DEBUG
 
-        return func.HttpResponse(
-            body=response.body if hasattr(response, "body") else "",
-            mimetype=response.content_type if hasattr(response, "content_type") else "application/json",
-            status_code=response.status if hasattr(response, "status") else 200
-        )
+            # Override OAuth endpoint for single-tenant
+            if APP_TYPE == "SingleTenant" and APP_TENANT_ID:
+                settings.oauth_endpoint = f"https://login.microsoftonline.com/{APP_TENANT_ID}"
+                print(f"Set OAuth authority to: {settings.oauth_endpoint}")
+
+            adapter = BotFrameworkAdapter(settings)
+            adapter._credentials = credentials
+            
+            print("Adapter created.")
+
+        except Exception as adapter_error:
+            print(f"Failed to create adapter: {adapter_error}")
+            return func.HttpResponse("Adapter creation failed.", status_code=500)
+
+        # Process the request
+        try:
+            req_json = req.get_json()
+            auth_header = req.headers.get('Authorization') or req.headers.get('authorization') or ''
+
+            asyncio_loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(asyncio_loop)
+
+            response = asyncio_loop.run_until_complete(
+                adapter.process_activity(
+                    req_json,
+                    req.headers.get('Authorization'),
+                    message_handler
+                )
+            )
+
+            if response:
+                return func.HttpResponse(
+                    body=response.body,
+                    mimetype=response.content_type,
+                    status_code=response.status
+                )
+            else:
+                return func.HttpResponse(status_code=202)
+
+        except Exception as process_error:
+            print(f"Error processing bot request: {process_error}")
+            return func.HttpResponse(
+                "An error occurred while processing the request.",
+                status_code=500
+            )
+
     except Exception as error:
-        print(f"Error processing bot request in main: {error}") # DEBUG
+        print(f"Unhandled error in main: {error}")
         return func.HttpResponse(
-            "An error occurred while processing the request.",
+            "Internal server error.",
             status_code=500
         )
-
