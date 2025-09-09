@@ -98,7 +98,7 @@ def get_rbac_table(conn):
     df = cur.fetch_pandas_all()
     cur.close()
     df.columns = df.columns.str.lower()
-    df = df.rename(columns={'username': 'user_id', 'role': 'role', 'location_id': 'store_id'})
+    df = df.rename(columns={'user_id': 'user_id', 'role': 'role', 'store_id': 'store_id'})
     print(f"RBAC table loaded, shape: {df.shape}") # DEBUG
     return df
 
@@ -244,6 +244,12 @@ def call_azure_openai(prompt, temperature=0.7, max_tokens=500):
 # --- The Core Bot Logic Handler ---
 async def message_handler(turn_context: TurnContext):
     print("Entered message_handler...")
+    
+    # --- HIGHLIGHT: Add this check to only process 'message' activities ---
+    if turn_context.activity.type != ActivityTypes.message:
+        print(f"Ignoring activity of type: {turn_context.activity.type}")
+        return # Exit the function for any non-message activity
+    
     user_query = turn_context.activity.text
     print(f"user_query: {user_query}")
     teams_user_id = turn_context.activity.from_property.id
@@ -300,7 +306,7 @@ async def message_handler(turn_context: TurnContext):
                 print(f"Error in find_measure_with_llm: {e}")
                 final_answer = "Sorry, I'm having trouble understanding your request right now."
                 await turn_context.send_activity(Activity(text=final_answer, type=ActivityTypes.message))
-                return # Exit if LLM call fails
+                return
 
             if measure:
                 try:
@@ -428,4 +434,3 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
             "An error occurred while processing the request.",
             status_code=500
         )
-
