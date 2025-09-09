@@ -1,73 +1,375 @@
-import azure.functions as func
-import os
 import logging
-import sys
-from botbuilder.core import BotFrameworkAdapter, BotFrameworkAdapterSettings, TurnContext, MessageFactory
-from botbuilder.schema import ActivityTypes
+import os
+import json
+import azure.functions as func
+
+# Bot Framework SDK Libraries
+from botbuilder.core import BotFrameworkAdapter, BotFrameworkAdapterSettings, TurnContext
+from botbuilder.schema import Activity, ActivityTypes
+
+import pandas as pd
+import requests
+import snowflake.connector
+import random
+from openai import AzureOpenAI
+from time import sleep
+import asyncio
 
 # Setup logging
 logger = logging.getLogger("azure")
 logger.setLevel(logging.INFO)
 handler = logging.StreamHandler(sys.stdout)
+formatter = logging.Formatter("[%(levelname)s] %(asctime)s - %(message)s")
+handler.setFormatter(formatter)
 if not logger.hasHandlers():
     logger.addHandler(handler)
 
-# Get bot credentials from environment variables
-# These must be set in your Azure Function App's "Configuration" tab
+# --- Configuration: Get environment variables from Azure Function App settings ---
+print("Loading environment variables...") # DEBUG
 APP_ID = os.environ.get("MicrosoftAppId", "")
 APP_PASSWORD = os.environ.get("MicrosoftAppPassword", "")
+APP_TYPE = os.environ.get("MicrosoftAppType", "")
+APP_TENANT_ID = os.environ.get("MicrosoftAppTenantId", "")
 
-# The bot's logic
-async def bot_logic(turn_context: TurnContext):
-    if turn_context.activity.type == ActivityTypes.message:
-        user_message = turn_context.activity.text or ""
-        logger.info(f"Received message: {user_message}")
-        
-        # The line that sends the echo reply
-        response_text = f"Echo: {user_message}"
-        await turn_context.send_activity(MessageFactory.text(response_text))
-        logger.info(f"Sent response: {response_text}")
+AZURE_OPENAI_KEY = os.environ.get("AZURE_OPENAI_KEY")
+AZURE_OPENAI_ENDPOINT = os.environ.get("AZURE_OPENAI_ENDPOINT")
+AZURE_OPENAI_DEPLOYMENT_NAME = os.environ.get("AZURE_OPENAI_DEPLOYMENT_NAME")
 
-    elif turn_context.activity.type == ActivityTypes.members_added:
-        for member in turn_context.activity.members_added:
-            if member.id != turn_context.activity.recipient.id:
-                await turn_context.send_activity("Hello! I'm an echo bot.")
-                logger.info("Sent welcome message to new member")
+SNOWFLAKE_USER = os.environ.get("SNOWFLAKE_USER")
+SNOWFLAKE_PASSWORD = os.environ.get("SNOWFLAKE_PASSWORD")
+SNOWFLAKE_ACCOUNT = os.environ.get("SNOWFLAKE_ACCOUNT")
+SNOWFLAKE_WAREHOUSE = os.environ.get("SNOWFLAKE_WAREHOUSE")
+SNOWFLAKE_DATABASE = os.environ.get("SNOWFLAKE_DATABASE")
+SNOWFLAKE_SCHEMA = os.environ.get("SNOWFLAKE_SCHEMA")
 
-# Create the adapter with the correct settings
-SETTINGS = BotFrameworkAdapterSettings(APP_ID, APP_PASSWORD)
-ADAPTER = BotFrameworkAdapter(SETTINGS)
+print(f"APP_ID: {APP_ID}, APP_PASSWORD: {(APP_PASSWORD)}") # DEBUG
+print(f"AZURE_OPENAI_KEY: {bool(AZURE_OPENAI_KEY)}, AZURE_OPENAI_ENDPOINT: {AZURE_OPENAI_ENDPOINT}, AZURE_OPENAI_DEPLOYMENT_NAME: {AZURE_OPENAI_DEPLOYMENT_NAME}") # DEBUG
+print(f"SNOWFLAKE_USER: {SNOWFLAKE_USER}, SNOWFLAKE_ACCOUNT: {SNOWFLAKE_ACCOUNT}") # DEBUG
 
-async def main(req: func.HttpRequest) -> func.HttpResponse:
+# --- Initialize the Bot Framework Adapter (MODIFIED) ---
+try:
+    settings = BotFrameworkAdapterSettings(APP_ID, APP_PASSWORD)
+    ADAPTER = BotFrameworkAdapter(settings)
+    print("BotFrameworkAdapter initialized.") # DEBUG
+except Exception as e:
+    print(f"Error initializing BotFrameworkAdapter: {e}") # DEBUG
+    ADAPTER = None
+
+# --- Initialize the Azure OpenAI Client ---
+try:
+    AZURE_OPENAI_CLIENT = AzureOpenAI(
+        api_key=AZURE_OPENAI_KEY,
+        azure_endpoint=AZURE_OPENAI_ENDPOINT,
+        api_version="2024-02-15-preview"
+    )
+    print("AzureOpenAI client initialized.") # DEBUG
+except Exception as e:
+    print(f"Error initializing AzureOpenAI client: {e}") # DEBUG
+    AZURE_OPENAI_CLIENT = None
+
+# --- Dynamic knowledge base loading from a file ---
+def load_knowledge_base():
+    print("Loading knowledge_base.json...") # DEBUG
     try:
-        logger.info(f"Processing bot request... Method: {req.method}")
+        path = os.path.join(os.path.dirname(__file__), "knowledge_base.json")
+        print(f"Knowledge base path: {path}") # DEBUG
+        with open(path, "r") as f:
+            kb = json.load(f)
+            print(f"Successfully loaded knowledge_base.json, length: {len(kb)}") # DEBUG
+            return kb
+    except FileNotFoundError:
+        print("knowledge_base.json not found. Please ensure it is in the same folder.") # DEBUG
+        return []
+    except Exception as e:
+        print(f"Error loading knowledge_base.json: {e}") # DEBUG
+        return []
 
-        if req.method == 'GET':
-            return func.HttpResponse("Bot endpoint is healthy", status_code=200)
+KNOWLEDGE_BASE_DATA = load_knowledge_base()
 
-        if req.method != 'POST':
-            return func.HttpResponse("Only POST requests are supported", status_code=405)
+# --- Snowflake Connection & Data Utilities ---
+def get_rbac_table(conn):
+    print("Fetching RBAC table from Snowflake...") # DEBUG
+    query = "SELECT USERNAME, ROLE, LOCATION_ID FROM ENTERPRISE.RETAIL_DATA.RBAC_WORK_TABLE"
+    cur = conn.cursor()
+    cur.execute(query)
+    df = cur.fetch_pandas_all()
+    cur.close()
+    df.columns = df.columns.str.lower()
+    df = df.rename(columns={'username': 'user_id', 'role': 'role', 'location_id': 'store_id'})
+    print(f"RBAC table loaded, shape: {df.shape}") # DEBUG
+    return df
 
-        # Process the incoming request
-        body = req.get_json()
-        auth_header = req.headers.get('Authorization') or req.headers.get('authorization')
-        
-        # This is the key line that processes the activity and runs your bot logic
-        invoke_response = await ADAPTER.process_activity(
-            body,
-            auth_header,
-            bot_logic
-        )
-        
-        if invoke_response:
-            return func.HttpResponse(
-                body=invoke_response.body,
-                status_code=invoke_response.status,
-                headers={"Content-Type": "application/json"}
-            )
+def get_sales_territory_keys(conn):
+    print("Fetching SalesTerritoryKeys from Snowflake...") # DEBUG
+    query = "SELECT DISTINCT SalesTerritoryKey FROM ENTERPRISE.RETAIL_DATA.SALES_FACT ORDER BY SalesTerritoryKey"
+    cur = conn.cursor()
+    cur.execute(query)
+    df = cur.fetch_pandas_all()
+    cur.close()
+    print(f"SalesTerritoryKeys loaded, count: {len(df)}") # DEBUG
+    return df['SALESTERRITORYKEY'].tolist()
+
+def create_location_to_territory_mapping(rbac_df, territory_keys):
+    print("Creating location-to-territory mapping...") # DEBUG
+    all_locations = sorted(rbac_df['store_id'].unique().tolist())
+    location_to_territory_map = {}
+    shuffled_territory_keys = territory_keys[:]
+    random.shuffle(shuffled_territory_keys)
+    territory_count = len(shuffled_territory_keys)
+    for i, location_id in enumerate(all_locations):
+        assigned_territory_key = shuffled_territory_keys[i % territory_count]
+        location_to_territory_map[location_id] = assigned_territory_key
+    print(f"Location-to-territory mapping created, length: {len(location_to_territory_map)}") # DEBUG
+    return location_to_territory_map
+
+def get_user_access(user_id, rbac_df):
+    print(f"Getting user access for user_id: {user_id}") # DEBUG
+    user_row = rbac_df[rbac_df['user_id'] == user_id]
+    if user_row.empty:
+        print("User access not found in RBAC table.") # DEBUG
+        return None
+    print("User access found.") # DEBUG
+    return {
+        "role": user_row.iloc[0]['role'],
+        "store_id": user_row.iloc[0]['store_id']
+    }
+
+def get_metric_value(conn, measure, store_id, location_to_territory_map):
+    print(f"Getting metric value for measure: {measure}, store_id: {store_id}") # DEBUG
+    sales_territory_key = location_to_territory_map.get(store_id)
+    if sales_territory_key is None:
+        print("Sales territory key not found for store_id.") # DEBUG
+        return {}
+    if measure['measure_name'].lower() == "sales amount":
+        query = f"""
+            SELECT SUM(SalesAmount) AS total_sales_amount
+            FROM ENTERPRISE.RETAIL_DATA.SALES_FACT
+            WHERE SalesTerritoryKey = {sales_territory_key}
+        """
+        try:
+            cur = conn.cursor()
+            cur.execute(query)
+            df_sales = cur.fetch_pandas_all()
+            cur.close()
+            df_sales.columns = df_sales.columns.str.lower()
+            total_sales = df_sales['total_sales_amount'][0] if not df_sales.empty else 0
+            print(f"Fetched total sales amount: {total_sales}") # DEBUG
+            return {"Sales Amount": total_sales}
+        except Exception as e:
+            print(f"Error querying Snowflake for Sales Amount: {e}") # DEBUG
+            return {"Sales Amount": 0.0}
+    if measure['measure_name'].lower() == "traffic conversion":
+        print("Returning default Traffic Conversion value.") # DEBUG
+        return {"Traffic Conversion": 0.0}
+    return {}
+
+def find_measure_with_llm(user_query, knowledge_base):
+    print(f"Finding measure with LLM for query: {user_query}") # DEBUG
+    measure_names = [item['measure_name'] for item in knowledge_base]
+    prompt = f"""
+    The user's query is: "{user_query}"
+    Based on the query, identify the most relevant measure from the following list.
+    If a measure is clearly mentioned or implied, respond ONLY with the measure name, nothing else.
+    If no measure is found, respond ONLY with the text "NO_MEASURE_FOUND".
+    Available measures: {', '.join(measure_names)}
+    Example 1:
+    Query: "What is my total sales amount for the month?"
+    Response: Sales Amount
+    Your response for the user's query:
+    """
+    try:
+        identified_measure = call_azure_openai(prompt, temperature=0.0, max_tokens=100)
+        print(f"Identified measure from LLM: {identified_measure}") # DEBUG
+        if identified_measure and identified_measure.strip().replace('.', '').lower() in [m.lower() for m in measure_names]:
+            for measure in knowledge_base:
+                if measure['measure_name'].lower() == identified_measure.strip().replace('.', '').lower():
+                    print(f"Returning found measure: {measure}") # DEBUG
+                    return measure
+    except Exception as e:
+        print(f"Error during LLM intent recognition: {e}") # DEBUG
+    print("No measure found.") # DEBUG
+    return None
+
+def build_llm_prompt(user, access, user_query, measure, sf_data=None, location_to_territory_map=None):
+    print("Building LLM prompt...") # DEBUG
+    if not measure or not access or location_to_territory_map is None:
+        print("Missing measure/access/data map for prompt.") # DEBUG
+        return "Sorry, I couldn't find the measure, your access info, or a valid data map."
+    sales_territory_key = location_to_territory_map.get(access['store_id'])
+    prompt_template = f"""
+    You are an AI assistant for a retail data team. Your user is a {access['role']} for store {access['store_id']} (which maps to sales territory {sales_territory_key}).
+    The user's query is: '{user_query}'
+    Here is the official definition of the requested measure and its current value for the user's store:
+    Description: {measure['description']}
+    DAX Formula: {measure['dax_formula']}
+    """
+    if sf_data and measure['measure_name'] in sf_data:
+        data_value = sf_data[measure['measure_name']]
+        if measure['measure_name'] == "Sales Amount":
+            data_string = f"${data_value:,.2f}"
         else:
-            return func.HttpResponse(status_code=202)
+            data_string = f"{data_value:.3f}"
+        prompt_template += f"\nFor your store ({access['store_id']}), the current {measure['measure_name']} is {data_string}."
 
+    prompt_template += f"""
+    Based ONLY on this information, provide a clear and concise answer to the user's question. After your answer, suggest 2-3 similar questions with insights and relevant measures that the user might want to ask next. Do not use any bolding, formatting, or headers like 'Answer:' or 'Suggestions:'. Just provide the response as plain text.
+    Your response:
+    """
+    print("LLM prompt built.") # DEBUG
+    return prompt_template.strip()
+
+def call_azure_openai(prompt, temperature=0.7, max_tokens=500):
+    print("Calling Azure OpenAI...") # DEBUG
+    if not AZURE_OPENAI_KEY or not AZURE_OPENAI_ENDPOINT or not AZURE_OPENAI_DEPLOYMENT_NAME:
+        print("Azure OpenAI configuration missing.") # DEBUG
+        return None
+    try:
+        response = AZURE_OPENAI_CLIENT.chat.completions.create(
+            model=AZURE_OPENAI_DEPLOYMENT_NAME,
+            messages=[
+                {"role": "user", "content": prompt}
+            ],
+            temperature=temperature,
+            max_tokens=max_tokens
+        )
+        print("Azure OpenAI response received.") # DEBUG
+        return response.choices[0].message.content
+    except Exception as e:
+        print(f"Azure OpenAI API Error: {e}") # DEBUG
+        return None
+
+# --- The Core Bot Logic Handler ---
+async def message_handler(turn_context: TurnContext):
+    print("Entered message_handler...") # DEBUG
+    try:
+        user_query = turn_context.activity.text
+        print(f"user_query: {user_query}") # DEBUG
+        teams_user_id = turn_context.activity.from_property.id
+        print(f"teams_user_id: {teams_user_id}") # DEBUG
+        final_answer = ""
+        conn = None
+
+        try:
+            print("Connecting to Snowflake...") # DEBUG
+            conn = snowflake.connector.connect(
+                user=SNOWFLAKE_USER,
+                password=SNOWFLAKE_PASSWORD,
+                account=SNOWFLAKE_ACCOUNT,
+                warehouse=SNOWFLAKE_WAREHOUSE,
+                database=SNOWFLAKE_DATABASE,
+                schema=SNOWFLAKE_SCHEMA
+            )
+            print("Connected to Snowflake.") # DEBUG
+
+            rbac_df = get_rbac_table(conn)
+            territory_keys = get_sales_territory_keys(conn)
+            location_to_territory_map = create_location_to_territory_mapping(rbac_df, territory_keys)
+
+            # --- MODIFIED SECTION FOR WEB CHAT TESTING ---
+            # Allow Web Chat and fallback users to use RBAC
+            rbac_user_id = None
+
+            # Try to use Teams ID mapping, else fallback for web chat
+            user_id_mapping = {
+                "29:1f77d853-90d5-4554-b5b5-f55e5898d9c5": "saisri", # Example Teams ID for user 'saisri'
+                "29:1a2b3c4d-5e6f-7a8b-9c0d-1e2f3a4b5c6d": "dev" # Example Teams ID for user 'dev'
+            }
+
+            rbac_user_id = user_id_mapping.get(teams_user_id, None)
+
+            # If unmapped, fallback to a default RBAC user for testing
+            if not rbac_user_id:
+                # Use any valid USER_ID from your RBAC table for test (e.g. "denise")
+                rbac_user_id = "denise"
+                print("Falling back to RBAC user_id for web chat testing:", rbac_user_id)
+
+            access = get_user_access(rbac_user_id, rbac_df)
+            print(f"access: {access}") # DEBUG
+
+            if not access:
+                print("Access information not found in RBAC table.") # DEBUG
+                final_answer = "Sorry, your access information could not be found in the RBAC table."
+            else:
+                measure = find_measure_with_llm(user_query, KNOWLEDGE_BASE_DATA)
+                print(f"measure: {measure}") # DEBUG
+                if measure:
+                    sf_data = get_metric_value(conn, measure, access['store_id'], location_to_territory_map)
+                    print(f"sf_data: {sf_data}") # DEBUG
+                    llm_prompt = build_llm_prompt(
+                        {"user_id": rbac_user_id},
+                        access,
+                        user_query,
+                        measure,
+                        sf_data=sf_data,
+                        location_to_territory_map=location_to_territory_map
+                    )
+                    print(f"llm_prompt: {llm_prompt[:200]}...") # DEBUG
+                    final_answer = call_azure_openai(llm_prompt)
+                    print(f"final_answer: {final_answer}") # DEBUG
+                else:
+                    print("Measure not found.") # DEBUG
+                    final_answer = "Sorry, I can't find that measure. Please ask about sales, traffic, or basket size."
+
+        except Exception as e:
+            print(f"Error processing bot request inner: {e}") # DEBUG
+            final_answer = "Sorry, an internal error occurred while processing your request. Please try again later."
+        finally:
+            if conn:
+                conn.close()
+                print("Snowflake connection closed.") # DEBUG
+
+        await turn_context.send_activity(Activity(text=final_answer, type=ActivityTypes.message))
+        print("Activity sent to bot.") # DEBUG
+
+    except Exception as e:
+        print(f"Error in message_handler outer: {e}") # DEBUG
+
+# --- The Main Azure Functions Entry Point ---
+def main(req: func.HttpRequest) -> func.HttpResponse:
+    print('Python HTTP trigger function received a request.') # DEBUG
+    try:
+        print("Parsing request JSON...") # DEBUG
+        req_json = req.get_json()
+        print(f"Request JSON: {req_json}") # DEBUG
+    except Exception as e:
+        print(f"Failed to parse request JSON: {e}") # DEBUG
+        req_json = None
+
+    # Check if ADAPTER was successfully initialized
+    if ADAPTER is None:
+        print("BotFrameworkAdapter is not initialized. Check your APP_ID and APP_PASSWORD environment variables.")
+        return func.HttpResponse(
+            "Bot adapter could not be initialized. Check environment variables.",
+            status_code=500
+        )
+
+    try:
+        print("Starting asyncio loop...") # DEBUG
+        loop = None
+        try:
+            loop = asyncio.get_event_loop()
+        except RuntimeError:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+
+        print("Processing activity...") # DEBUG
+        response = loop.run_until_complete(
+            ADAPTER.process_activity(
+                req_json,
+                req.headers,
+                message_handler
+            )
+        )
+        print("Activity processed.") # DEBUG
+
+        return func.HttpResponse(
+            body=response.body if hasattr(response, "body") else "",
+            mimetype=response.content_type if hasattr(response, "content_type") else "application/json",
+            status_code=response.status if hasattr(response, "status") else 200
+        )
     except Exception as error:
-        logger.error(f"Unhandled error: {str(error)}", exc_info=True)
-        return func.HttpResponse(f"Internal server error: {str(error)}", status_code=500)
+        print(f"Error processing bot request in main: {error}") # DEBUG
+        return func.HttpResponse(
+            "An error occurred while processing the request.",
+            status_code=500
+        )
