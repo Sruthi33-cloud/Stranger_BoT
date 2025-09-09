@@ -1,8 +1,4 @@
-# Docs for the Azure Web Apps Deploy action: https://github.com/azure/functions-action
-# More GitHub Actions for Azure: https://github.com/Azure/actions
-# More info on Python, GitHub Actions, and Azure Functions: https://aka.ms/python-webapps-actions
-
-name: Build and deploy Python project to Azure Function App - New-Gen-AI-Bot
+name: Deploy Python project to Azure Function App - Direct Deployment
 
 on:
   push:
@@ -11,7 +7,6 @@ on:
   workflow_dispatch:
 
 env:
-  AZURE_FUNCTIONAPP_PACKAGE_PATH: '.' 
   PYTHON_VERSION: '3.9'
 
 jobs:
@@ -30,6 +25,10 @@ jobs:
         with:
           python-version: ${{ env.PYTHON_VERSION }}
 
+      - name: Install dependencies
+        run: |
+          pip install --target=".python_packages/lib/site-packages" -r ./requirements.txt
+
       - name: Login to Azure
         uses: azure/login@v2
         with:
@@ -37,9 +36,9 @@ jobs:
           tenant-id: ${{ secrets.AZUREAPPSERVICE_TENANTID_17D15F6CCE0B4E8E87911BFE0A8B5BC4 }}
           subscription-id: ${{ secrets.AZUREAPPSERVICE_SUBSCRIPTIONID_B5DEAE70807C4B13B455789DAF31B6AF }}
       
-      - name: 'Deploy to Azure Functions'
+      - name: 'Deploy to Azure Function App'
         uses: Azure/functions-action@v1
         with:
           app-name: 'New-Gen-AI-Bot'
-          package: ${{ env.AZURE_FUNCTIONAPP_PACKAGE_PATH }}
-          scm-do-build-during-deployment: true
+          package: '.' # This will deploy the entire folder, including .python_packages
+          scm-do-build-during-deployment: false # Crucial change
