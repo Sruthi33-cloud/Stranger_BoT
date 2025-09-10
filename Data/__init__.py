@@ -201,7 +201,6 @@ def find_measure_with_llm(user_query, knowledge_base):
             ],
             tools=tools,
             tool_choice="auto", # Let the model decide whether to call the tool
-            temperature=0.0
         )
         
         # 3. Check if the LLM chose to call the tool
@@ -266,7 +265,7 @@ def call_azure_openai(prompt, temperature=0.7, max_tokens=500):
                 {"role": "user", "content": prompt}
             ],
             temperature=temperature,
-            max_tokens=max_tokens
+            max_tokens=512
         )
         print("Azure OpenAI response received.") # DEBUG
         return response.choices[0].message.content
@@ -471,4 +470,5 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
             "An error occurred while processing the request.",
             status_code=500
         )
+
 
