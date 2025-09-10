@@ -253,7 +253,7 @@ def build_llm_prompt(user, access, user_query, measure, sf_data=None, location_t
     print("LLM prompt built.") # DEBUG
     return prompt_template.strip()
 
-def call_azure_openai(prompt, temperature=0.7, max_tokens=500):
+def call_azure_openai(prompt, max_tokens=500):
     print("Calling Azure OpenAI...") # DEBUG
     if not AZURE_OPENAI_KEY or not AZURE_OPENAI_ENDPOINT or not AZURE_OPENAI_DEPLOYMENT_NAME:
         print("Azure OpenAI configuration missing.") # DEBUG
@@ -264,7 +264,6 @@ def call_azure_openai(prompt, temperature=0.7, max_tokens=500):
             messages=[
                 {"role": "user", "content": prompt}
             ],
-            temperature=temperature,
             max_completion_tokens=max_tokens
         )
         print("Azure OpenAI response received.") # DEBUG
@@ -470,6 +469,7 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
             "An error occurred while processing the request.",
             status_code=500
         )
+
 
 
 
