@@ -62,7 +62,7 @@ try:
     AZURE_OPENAI_CLIENT = AzureOpenAI(
         api_key=AZURE_OPENAI_KEY,
         azure_endpoint=AZURE_OPENAI_ENDPOINT,
-        api_version="2024-02-15-preview"
+        api_version="2025-01-01-preview"
     )
     print("AzureOpenAI client initialized.") # DEBUG
 except Exception as e:
@@ -471,3 +471,4 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
             "An error occurred while processing the request.",
             status_code=500
         )
+
