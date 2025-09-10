@@ -265,7 +265,7 @@ def call_azure_openai(prompt, temperature=0.7, max_tokens=500):
                 {"role": "user", "content": prompt}
             ],
             temperature=temperature,
-            max_tokens=512
+            max_completion_tokens=max_tokens
         )
         print("Azure OpenAI response received.") # DEBUG
         return response.choices[0].message.content
@@ -470,5 +470,6 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
             "An error occurred while processing the request.",
             status_code=500
         )
+
 
 
