@@ -6,6 +6,7 @@ import sys
 import asyncio
 from typing import Dict, List, Optional, Any
 import re
+import traceback
 
 from botbuilder.core import BotFrameworkAdapter, BotFrameworkAdapterSettings, TurnContext
 from botbuilder.schema import Activity, ActivityTypes
@@ -15,13 +16,18 @@ import pandas as pd
 import snowflake.connector
 from openai import AzureOpenAI
 
-# Logging
-logger = logging.getLogger("azure")
+# Robust logging configuration for Azure Functions
+LOG_FORMAT = "[%(levelname)s] %(asctime)s - %(name)s - %(message)s"
+# Ensure root logger writes to stdout (Functions captures stdout)
+root = logging.getLogger()
+if not any(isinstance(h, logging.StreamHandler) for h in root.handlers):
+    stream_handler = logging.StreamHandler(sys.stdout)
+    stream_handler.setFormatter(logging.Formatter(LOG_FORMAT))
+    root.addHandler(stream_handler)
+root.setLevel(logging.INFO)
+
+logger = logging.getLogger("azure_bot_message_handler")
 logger.setLevel(logging.INFO)
-if not logger.hasHandlers():
-    h = logging.StreamHandler(sys.stdout)
-    h.setFormatter(logging.Formatter("[%(levelname)s] %(asctime)s - %(message)s"))
-    logger.addHandler(h)
 
 # Single-tenant auth
 class SingleTenantAppCredentials(MicrosoftAppCredentials):
@@ -47,6 +53,11 @@ SNOWFLAKE_WAREHOUSE = os.environ.get("SNOWFLAKE_WAREHOUSE")
 SNOWFLAKE_DATABASE = os.environ.get("SNOWFLAKE_DATABASE")
 SNOWFLAKE_SCHEMA = os.environ.get("SNOWFLAKE_SCHEMA")
 
+# Log env var presence (do NOT log secrets)
+logger.info(f"Env check - MicrosoftAppId set: {bool(APP_ID)}; App Type: {APP_TYPE}; Tenant set: {bool(APP_TENANT_ID)}")
+logger.info(f"Env check - Snowflake set: {all([SNOWFLAKE_USER, SNOWFLAKE_ACCOUNT, SNOWFLAKE_DATABASE, SNOWFLAKE_SCHEMA])}")
+logger.info(f"Env check - AppInsights present: {bool(os.environ.get('APPLICATIONINSIGHTS_CONNECTION_STRING') or os.environ.get('APPINSIGHTS_INSTRUMENTATIONKEY'))}")
+
 # OpenAI client
 AZURE_OPENAI_CLIENT = None
 try:
@@ -59,8 +70,8 @@ try:
         logger.info("AzureOpenAI client initialized.")
     else:
         logger.warning("Azure OpenAI environment variables are missing. LLM fallback disabled.")
-except Exception as e:
-    logger.error(f"Error initializing AzureOpenAI client: {e}")
+except Exception:
+    logger.exception("Error initializing AzureOpenAI client")
     AZURE_OPENAI_CLIENT = None
 
 # SOLUTION: PURELY ROBUST DATA-TYPE-BASED COLUMN DETECTION
@@ -68,14 +79,12 @@ _column_cache = {}
 
 def get_table_columns(conn, table_name: str) -> Dict[str, str]:
     """Get column names and data types dynamically - cached for performance"""
-    # Use the uppercase table name as Snowflake stores metadata in uppercase
     upper_table_name = table_name.upper()
     if upper_table_name in _column_cache:
         return _column_cache[upper_table_name]
 
     try:
         cur = conn.cursor()
-        # Get column info with data types from Snowflake information schema
         cur.execute(f"""
         SELECT COLUMN_NAME, DATA_TYPE
         FROM INFORMATION_SCHEMA.COLUMNS
@@ -86,24 +95,20 @@ def get_table_columns(conn, table_name: str) -> Dict[str, str]:
 
         columns = {}
         for row in cur.fetchall():
-            # Store column names in their original case, as Snowflake is case-sensitive
             col_name = row[0]
             data_type = row[1].upper()
             columns[col_name] = data_type
-        
+
         cur.close()
         _column_cache[upper_table_name] = columns
         logger.info(f"Cached columns for {upper_table_name}: {[(name, dtype) for name, dtype in columns.items()]}")
         return columns
 
-    except Exception as e:
-        logger.error(f"Error getting columns for {upper_table_name}: {e}")
+    except Exception:
+        logger.exception(f"Error getting columns for {upper_table_name}")
         return {}
-    
+
 def find_column_by_data_type(columns: Dict[str, str], data_type_patterns: List[str]) -> Optional[str]:
-    """
-    Find column by data type.
-    """
     for col_name, data_type in columns.items():
         for pattern in data_type_patterns:
             if pattern.upper() in data_type.upper():
@@ -111,41 +116,26 @@ def find_column_by_data_type(columns: Dict[str, str], data_type_patterns: List[s
                 return col_name
     return None
 
-# THE NEW PURELY ROBUST QUERY BUILDER
 class RobustQueryBuilder:
-    """
-    Uses DATABASE METADATA instead of guessing column names.
-    """
     def __init__(self, conn):
         self.conn = conn
-        # Use uppercase table names to match how they are stored in the cache
         self.sales_fact_cols = get_table_columns(conn, 'SALES_FACT')
         self.rbac_cols = get_table_columns(conn, 'RBAC_WORK_TABLE')
-    
+
     def build_sales_query(self, user_id: str) -> Optional[str]:
-        """
-        Build query using DATA TYPES to identify columns - works with ANY column names!
-        FIXED: The final query now uses the dynamically discovered column names.
-        """
-        # Step 1: Find the AMOUNT column using data type
         sales_amount_col = find_column_by_data_type(self.sales_fact_cols,
             ['NUMBER', 'DECIMAL', 'FLOAT', 'NUMERIC', 'REAL', 'DOUBLE']
         )
-
-        # Step 2: Find DATE columns for joining
         sales_date_col = find_column_by_data_type(self.sales_fact_cols,
             ['DATE', 'TIMESTAMP', 'TIME', 'DATETIME']
         )
         rbac_date_col = find_column_by_data_type(self.rbac_cols,
             ['DATE', 'TIMESTAMP', 'TIME', 'DATETIME']
         )
-        
-        # Step 3: Find the User ID column (assuming a string type)
         rbac_user_col = find_column_by_data_type(self.rbac_cols, 
             ['VARCHAR', 'TEXT', 'STRING', 'CHAR']
         )
-        
-        # Step 4: Validate we found required columns
+
         if not sales_amount_col:
             logger.error("No numeric (sales) column found in SALES_FACT table")
             return None
@@ -158,12 +148,10 @@ class RobustQueryBuilder:
         if not rbac_user_col:
             logger.error("No user ID column found in RBAC_WORK_TABLE for filtering")
             return None
-        
-        # Define fully qualified names using environment variables
+
         DB_SCHEMA_SALES = f"{SNOWFLAKE_DATABASE}.{SNOWFLAKE_SCHEMA}.SALES_FACT"
         DB_SCHEMA_RBAC = f"{SNOWFLAKE_DATABASE}.{SNOWFLAKE_SCHEMA}.RBAC_WORK_TABLE"
 
-        # Step 5: Build query with ACTUAL column names (whatever they are!)
         query = f"""
         SELECT COALESCE(SUM(t1.{sales_amount_col}), 0) 
         FROM {DB_SCHEMA_SALES} t1
@@ -171,28 +159,26 @@ class RobustQueryBuilder:
         ON t1.{sales_date_col} = t2.{rbac_date_col}
         WHERE t2.{rbac_user_col} = '{user_id}';
         """
-        
+
         logger.info(f"Built adaptive query: {query}")
         logger.info(f" Amount column: {sales_amount_col}")
         logger.info(f" Sales date column: {sales_date_col}")
         logger.info(f" RBAC date column: {rbac_date_col}")
         logger.info(f" RBAC User column: {rbac_user_col}")
-        
+
         return query
 
-# Knowledge base
+# Knowledge base loading unchanged except improved exception logging
 def load_knowledge_base():
     try:
         path = os.path.join(os.path.dirname(__file__), "knowledge_base.json")
-        # Check if the file exists before opening it
         if not os.path.exists(path):
             raise FileNotFoundError(f"knowledge_base.json not found at {path}")
 
         with open(path, "r") as f:
             return json.load(f)
-    except Exception as e:
-        logger.error(f"Error loading knowledge_base.json: {e}")
-        # Return the default knowledge base data if the file fails to load
+    except Exception:
+        logger.exception("Error loading knowledge_base.json, using default KB")
         return [
             {
                 "measure_name": "Sales Amount",
@@ -217,12 +203,9 @@ for item in KNOWLEDGE_BASE_DATA:
     for alias in item['aliases']:
         ALIAS_TO_TOOL_NAME[alias.lower()] = item['tool_name']
 
-# Intent recognition cache
 _intent_cache = {}
 
 def get_user_data(user_id: str, conn) -> Optional[Dict[str, Any]]:
-    # This function now always queries the database to get the latest data
-    # NOTE: Hardcoded table/schema names below. They should be verified.
     query = f"SELECT USER_ID, ROLE, STORE_ID FROM {SNOWFLAKE_DATABASE}.{SNOWFLAKE_SCHEMA}.RBAC_WORK_TABLE WHERE USER_ID = '{user_id.upper()}'"
     try:
         cur = conn.cursor()
@@ -230,8 +213,6 @@ def get_user_data(user_id: str, conn) -> Optional[Dict[str, Any]]:
         df = cur.fetch_pandas_all()
         cur.close()
         df.columns = df.columns.str.lower()
-        
-        # User ID lookup should be direct based on the WHERE clause, but we ensure case-insensitivity here
         user_row = df[df['user_id'].str.lower() == user_id.lower()]
         if user_row.empty:
             logger.error(f"User ID {user_id} not found in RBAC table.")
@@ -239,8 +220,8 @@ def get_user_data(user_id: str, conn) -> Optional[Dict[str, Any]]:
         return {"role": user_row.iloc[0]['role'],
                 "store_id": user_row.iloc[0]['store_id']
                 }
-    except Exception as e:
-        logger.error(f"Error getting user data: {e}")
+    except Exception:
+        logger.exception("Error getting user data")
         return None
 
 def get_available_metrics_list() -> str:
@@ -250,37 +231,31 @@ def get_available_metrics_list() -> str:
     else:
         return ", ".join(metrics[:-1]) + f", and {metrics[-1]}"
 
-# Intent recognition
 def identify_metric_intent(user_query: str) -> Optional[str]:
-    # Check cache first
     query_key = user_query.lower().strip()
     if query_key in _intent_cache:
         logger.info(f"Cache hit for query: '{user_query}' -> {_intent_cache[query_key]}")
         return _intent_cache[query_key]
-    
-    # ... (rest of identify_metric_intent function remains the same) ...
 
     query_lower = user_query.lower()
     logger.info(f"Intent recognition for query: '{user_query}'")
-    
-    # Pre-filter unrelated queries
+
     unrelated_patterns = ["how are you", "what's your name", "weather", "time",
                           "joke", "story", "recipe", "news", "sports", "music"]
-    
+
     for pattern in unrelated_patterns:
         if pattern in query_lower and len(user_query.strip()) < 50:
             logger.info(f"Detected unrelated pattern: {pattern}")
             _intent_cache[query_key] = "UNRELATED"
             return "UNRELATED"
 
-    # Direct keyword matching
     traffic_keywords = ["traffic", "conversion", "convert", "visits"]
     for keyword in traffic_keywords:
         if keyword in query_lower:
             logger.info(f"Traffic keyword match found: {keyword}")
             _intent_cache[query_key] = "traffic_conversion"
             return "traffic_conversion"
-    
+
     sales_keywords = ["sales", "revenue", "amount", "money", "dollar"]
     for keyword in sales_keywords:
         if keyword in query_lower:
@@ -288,31 +263,25 @@ def identify_metric_intent(user_query: str) -> Optional[str]:
             _intent_cache[query_key] = "sales_amount"
             return "sales_amount"
 
-    # Check aliases
     for alias, tool_name in ALIAS_TO_TOOL_NAME.items():
         if alias in query_lower:
             logger.info(f"Alias match found: {alias} -> {tool_name}")
             _intent_cache[query_key] = tool_name
             return tool_name
 
-    # MINIMAL TOKEN LLM fallback
     if not AZURE_OPENAI_CLIENT:
         _intent_cache[query_key] = None
         return None
-        
+
     prompt = f"'{user_query}' sales or traffic?"
-    
     try:
         response = AZURE_OPENAI_CLIENT.chat.completions.create(
             model=AZURE_OPENAI_DEPLOYMENT_NAME,
             messages=[{"role": "user", "content": prompt}],
             max_completion_tokens=8
         )
-        
         result = response.choices[0].message.content.strip().lower()
         logger.info(f"LLM result: {result}")
-        
-        # Parse minimal response
         if "traffic" in result:
             _intent_cache[query_key] = "traffic_conversion"
             return "traffic_conversion"
@@ -322,25 +291,17 @@ def identify_metric_intent(user_query: str) -> Optional[str]:
         else:
             _intent_cache[query_key] = "UNRELATED"
             return "UNRELATED"
-            
-    except Exception as e:
-        logger.error(f"LLM intent error: {e}")
+    except Exception:
+        logger.exception("LLM intent error")
         _intent_cache[query_key] = None
         return None
 
-
-# DATA RETRIEVAL
 def get_metric_value_fast(conn, tool_name: str, store_id: int, user_id: str, query: str) -> Optional[float | str]:
-    """
-    Data retrieval that works with ANY column names thanks to data-type detection
-    """
     try:
         user_session = get_user_session(user_id, conn)
         if not user_session:
             return "Access denied"
 
-        # Check store access permissions (NOTE: This checks if the requested store ID 
-        # matches the user's assigned store ID from the session data)
         if store_id != user_session.store_id:
             access_denied_response = """Sorry I couldn't provide that information. I can only provide data for your assigned store (Store ID: {}).
             
@@ -353,31 +314,25 @@ def get_metric_value_fast(conn, tool_name: str, store_id: int, user_id: str, que
             return access_denied_response
 
         if tool_name == "sales_amount":
-            # Execute the data-type-based query
             cur = conn.cursor()
             cur.execute(query)
             result = cur.fetchone()
             cur.close()
             return float(result[0]) if result and result[0] is not None else 0.0
         elif tool_name == "traffic_conversion":
-            # NOTE: This metric is hardcoded to 0.000 for now.
             return 0.000
         return None
-    except Exception as e:
-        logger.error(f"Metric query error: {e}")
-        # Return a specific string to signal a data retrieval failure
+    except Exception:
+        logger.exception("Metric query error")
         return "data_retrieval_failed"
 
-# Response generation (unchanged)
 def generate_rich_response(user_query: str, tool_name: str, metric_value: float, store_id: int) -> str:
     logger.info(f"Generating response for tool_name: {tool_name}, value: {metric_value}")
-    
     measure_info = TOOL_NAME_TO_MEASURE.get(tool_name)
     if not measure_info:
         logger.error(f"No measure info found for tool_name: {tool_name}")
         return f"Metric not found for store {store_id}."
 
-    # Format value
     if tool_name == "sales_amount":
         formatted_value = f"${metric_value:,.2f}"
     elif tool_name == "traffic_conversion":
@@ -386,10 +341,9 @@ def generate_rich_response(user_query: str, tool_name: str, metric_value: float,
         formatted_value = f"{metric_value:.2f}"
 
     logger.info(f"Formatted value: {formatted_value}")
-    
     measure_name = measure_info['measure_name']
     description = measure_info['description']
-    
+
     base_response = f"For store {store_id}, **{measure_name}** is defined as {description.lower()}, and the current {measure_name} value is **{formatted_value}**."
 
     if tool_name == "sales_amount":
@@ -398,13 +352,11 @@ def generate_rich_response(user_query: str, tool_name: str, metric_value: float,
         suggestions = ' You might also ask: "What are the total store visits for my store?" or "How many sales transactions did we record to calculate this measure?"'
     else:
         suggestions = ' You might also ask: "How can I improve this metric?" or "What factors influence this measure?"'
-    
+
     final_response = base_response + suggestions
     logger.info(f"Final response generated: {final_response[:100]}...")
-    
     return final_response
 
-# Session management (unchanged)
 class UserSession:
     def __init__(self, user_id: str, role: str, store_id: int):
         self.user_id = user_id
@@ -427,18 +379,17 @@ def get_user_session(user_id: str, conn) -> Optional[UserSession]:
 async def message_handler(turn_context: TurnContext):
     if turn_context.activity.type != ActivityTypes.message:
         return
-    
-    user_query = turn_context.activity.text.strip()
+
+    user_query = (turn_context.activity.text or "").strip()
     # NOTE: Hardcoded user ID - replace this with dynamic extraction in production!
-    user_id = "victor" 
-    
+    user_id = "victor"
+
     if not user_query or len(user_query) > 300:
         await turn_context.send_activity("Please ask a specific question about store metrics.")
         return
-    
+
     conn = None
     try:
-        # Check if environment variables for Snowflake exist
         if not all([SNOWFLAKE_USER, SNOWFLAKE_PASSWORD, SNOWFLAKE_ACCOUNT, SNOWFLAKE_WAREHOUSE, SNOWFLAKE_DATABASE, SNOWFLAKE_SCHEMA]):
              logger.error("One or more Snowflake environment variables are missing.")
              await turn_context.send_activity("Database configuration is incomplete. Please contact support.")
@@ -452,13 +403,12 @@ async def message_handler(turn_context: TurnContext):
             database=SNOWFLAKE_DATABASE,
             schema=SNOWFLAKE_SCHEMA
         )
-        
+
         session = get_user_session(user_id, conn)
         if not session:
             await turn_context.send_activity("Access denied. Could not find user data. Contact support.")
             return
 
-        # Intent recognition with caching
         logger.info(f"Processing user query: '{user_query}'")
         tool_name = identify_metric_intent(user_query)
         logger.info(f"Identified tool_name: {tool_name}")
@@ -487,27 +437,21 @@ async def message_handler(turn_context: TurnContext):
             await turn_context.send_activity(no_match_response)
             return
 
-        # Extract store_id from user query if mentioned
         requested_store_id = session.store_id
         user_query_lower = user_query.lower()
-
-        # Simple pattern matching for "store [number]"
         store_match = re.search(r'store\s*#?(\d+)', user_query_lower)
         if store_match:
             try:
                 requested_store_id = int(store_match.group(1))
             except (ValueError, IndexError):
                 pass
-        
-        # Use the PURELY ROBUST QUERY BUILDER to build the query
+
         query_builder = RobustQueryBuilder(conn)
-        # Pass the dynamic user_id for the WHERE clause
-        query = query_builder.build_sales_query(user_id) 
+        query = query_builder.build_sales_query(user_id)
         if query is None:
             await turn_context.send_activity("The requested data is not available because of missing schema metadata. Please check the database connection and table structures.")
             return
 
-        # Get metric value with the robust query
         metric_value = get_metric_value_fast(conn, tool_name, requested_store_id, user_id, query)
         logger.info(f"Retrieved metric_value: {metric_value} for tool_name: {tool_name}")
 
@@ -515,7 +459,6 @@ async def message_handler(turn_context: TurnContext):
             if metric_value == "data_retrieval_failed":
                 await turn_context.send_activity("There was a problem retrieving data for that metric. Please check the Function logs for a detailed SQL error.")
             else:
-                # This catches access denied messages
                 await turn_context.send_activity(metric_value)
             return
 
@@ -523,24 +466,27 @@ async def message_handler(turn_context: TurnContext):
             await turn_context.send_activity(f"Cannot retrieve data for store {requested_store_id}.")
             return
 
-        # Generate response - NO API CALLS
         response = generate_rich_response(user_query, tool_name, metric_value, requested_store_id)
         await turn_context.send_activity(response)
-        
+
         session.last_queries.append({"query": user_query, "metric": tool_name})
         if len(session.last_queries) > 3:
             session.last_queries.pop(0)
 
-    except Exception as e:
-        logger.error(f"FATAL ERROR in message_handler: {e}")
-        # This sends the final catch-all error message
-        await turn_context.send_activity("Service temporarily unavailable. A critical error occurred. Please try again.") 
+    except Exception:
+        # Log full traceback to Application Insights / stdout
+        logger.exception("FATAL ERROR in message_handler")
+        await turn_context.send_activity("Service temporarily unavailable. A critical error occurred. Please try again.")
     finally:
         if conn:
-            conn.close()
+            try:
+                conn.close()
+            except Exception:
+                logger.exception("Error closing DB connection")
 
-# Main function (unchanged)
+# Main function
 def main(req: func.HttpRequest) -> func.HttpResponse:
+    logger.info(f"Main entry - method={req.method}")
     if req.method == 'GET':
         return func.HttpResponse("Bot endpoint is healthy", status_code=200)
 
@@ -548,11 +494,18 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
         return func.HttpResponse("Only POST requests supported.", status_code=405)
 
     try:
-        req_json = req.get_json()
+        try:
+            req_json = req.get_json()
+        except Exception:
+            req_body = req.get_body().decode('utf-8', errors='ignore')
+            logger.info("Could not json-decode body; logging raw body for debugging")
+            logger.info(req_body)
+            req_json = json.loads(req_body) if req_body else {}
+
+        logger.info(f"Incoming activity payload keys: {list(req_json.keys())}")
         activity = Activity.deserialize(req_json)
         auth_header = req.headers.get('Authorization') or req.headers.get('authorization') or ''
 
-        # Use SingleTenantAppCredentials as you specified you are using a single tenant
         if APP_TYPE == "SingleTenant" and APP_TENANT_ID:
             credentials = SingleTenantAppCredentials(APP_ID, APP_PASSWORD, APP_TENANT_ID)
             settings = BotFrameworkAdapterSettings(app_id=APP_ID, app_password=APP_PASSWORD)
@@ -561,22 +514,27 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
             credentials = MicrosoftAppCredentials(APP_ID, APP_PASSWORD)
             settings = BotFrameworkAdapterSettings(app_id=APP_ID, app_password=APP_PASSWORD)
 
-
         adapter = BotFrameworkAdapter(settings)
         adapter._credentials = credentials
-        
+
         asyncio_loop = asyncio.new_event_loop()
         asyncio.set_event_loop(asyncio_loop)
-        
-        response = asyncio_loop.run_until_complete(
-            adapter.process_activity(activity, auth_header, message_handler)
-        )
+
+        # Wrap the adapter processing to capture exceptions to logs
+        try:
+            response = asyncio_loop.run_until_complete(
+                adapter.process_activity(activity, auth_header, message_handler)
+            )
+            logger.info(f"Adapter processed activity. Response: {getattr(response, 'status', None)}")
+        except Exception:
+            logger.exception("Error during adapter.process_activity")
+            raise
 
         return func.HttpResponse(
             body=response.body if response else "",
             status_code=response.status if response else 202
         )
 
-    except Exception as e:
-        logger.error(f"Error processing request in main: {e}")
+    except Exception:
+        logger.exception("Error processing request in main")
         return func.HttpResponse("Internal server error during request processing.", status_code=500)
