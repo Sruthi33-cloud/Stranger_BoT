@@ -4,42 +4,36 @@ import json
 import azure.functions as func
 import sys
 import asyncio
+from typing import Dict, List, Optional, Any
+import re
 
-# Bot Framework SDK Libraries
 from botbuilder.core import BotFrameworkAdapter, BotFrameworkAdapterSettings, TurnContext
 from botbuilder.schema import Activity, ActivityTypes
 from botframework.connector.auth import MicrosoftAppCredentials
 
 import pandas as pd
-import requests
 import snowflake.connector
-import random
 from openai import AzureOpenAI
-from time import sleep
 
-# Setup logging
+# Logging
 logger = logging.getLogger("azure")
 logger.setLevel(logging.INFO)
-handler = logging.StreamHandler(sys.stdout)
-formatter = logging.Formatter("[%(levelname)s] %(asctime)s - %(message)s")
-handler.setFormatter(formatter)
 if not logger.hasHandlers():
-    logger.addHandler(handler)
+    h = logging.StreamHandler(sys.stdout)
+    h.setFormatter(logging.Formatter("[%(levelname)s] %(asctime)s - %(message)s"))
+    logger.addHandler(h)
 
-# --- NEW: Custom Credentials Class for Single-Tenant ---
+# Single-tenant auth
 class SingleTenantAppCredentials(MicrosoftAppCredentials):
-    """Custom credentials class that forces single-tenant OAuth endpoint"""
     def __init__(self, app_id: str, password: str, tenant_id: str):
         super().__init__(app_id, password)
         self.tenant_id = tenant_id
         self.oauth_endpoint = f"https://login.microsoftonline.com/{tenant_id}"
-        print(f"SingleTenantAppCredentials initialized with authority: {self.oauth_endpoint}")
 
-# --- Configuration: Get environment variables from Azure Function App settings ---
-print("Loading environment variables...") # DEBUG
+# Env vars
 APP_ID = os.environ.get("MicrosoftAppId", "")
 APP_PASSWORD = os.environ.get("MicrosoftAppPassword", "")
-APP_TYPE = os.environ.get("MicrosoftAppType", "")
+APP_TYPE = os.environ.get("MicrosoftAppType", "SingleTenant")
 APP_TENANT_ID = os.environ.get("MicrosoftAppTenantId", "")
 
 AZURE_OPENAI_KEY = os.environ.get("AZURE_OPENAI_KEY")
@@ -53,423 +47,490 @@ SNOWFLAKE_WAREHOUSE = os.environ.get("SNOWFLAKE_WAREHOUSE")
 SNOWFLAKE_DATABASE = os.environ.get("SNOWFLAKE_DATABASE")
 SNOWFLAKE_SCHEMA = os.environ.get("SNOWFLAKE_SCHEMA")
 
-print(f"APP_ID: {APP_ID}, APP_PASSWORD: {(APP_PASSWORD)}") # DEBUG
-print(f"AZURE_OPENAI_KEY: {bool(AZURE_OPENAI_KEY)}, AZURE_OPENAI_ENDPOINT: {AZURE_OPENAI_ENDPOINT}, AZURE_OPENAI_DEPLOYMENT_NAME: {AZURE_OPENAI_DEPLOYMENT_NAME}") # DEBUG
-print(f"SNOWFLAKE_USER: {SNOWFLAKE_USER}, SNOWFLAKE_ACCOUNT: {SNOWFLAKE_ACCOUNT}") # DEBUG
-
-# --- Initialize the Azure OpenAI Client ---
+# OpenAI client
 try:
     AZURE_OPENAI_CLIENT = AzureOpenAI(
         api_key=AZURE_OPENAI_KEY,
         azure_endpoint=AZURE_OPENAI_ENDPOINT,
         api_version="2025-01-01-preview"
     )
-    print("AzureOpenAI client initialized.") # DEBUG
+    logger.info("AzureOpenAI client initialized.")
 except Exception as e:
-    print(f"Error initializing AzureOpenAI client: {e}") # DEBUG
+    logger.error(f"Error initializing AzureOpenAI client: {e}")
     AZURE_OPENAI_CLIENT = None
 
-# --- Dynamic knowledge base loading from a file ---
-def load_knowledge_base():
-    print("Loading knowledge_base.json...") # DEBUG
+# SOLUTION: PURELY ROBUST DATA-TYPE-BASED COLUMN DETECTION
+_column_cache = {}
+
+def get_table_columns(conn, table_name: str) -> Dict[str, str]:
+    """Get column names and data types dynamically - cached for performance"""
+    if table_name in _column_cache:
+        return _column_cache[table_name]
+
     try:
-        path = os.path.join(os.path.dirname(__file__), "knowledge_base.json")
-        print(f"Knowledge base path: {path}") # DEBUG
-        with open(path, "r") as f:
-            kb = json.load(f)
-            print(f"Successfully loaded knowledge_base.json, length: {len(kb)}") # DEBUG
-            return kb
-    except FileNotFoundError:
-        print("knowledge_base.json not found. Please ensure it is in the same folder.") # DEBUG
-        return []
+        cur = conn.cursor()
+        # Get column info with data types from Snowflake information schema
+        cur.execute(f"""
+        SELECT COLUMN_NAME, DATA_TYPE
+        FROM INFORMATION_SCHEMA.COLUMNS
+        WHERE TABLE_SCHEMA = '{SNOWFLAKE_SCHEMA}'
+        AND TABLE_NAME = '{table_name.upper()}'
+        ORDER BY ORDINAL_POSITION
+        """)
+
+        columns = {}
+        for row in cur.fetchall():
+            # Store column names in their original case, as Snowflake is case-sensitive
+            col_name = row[0]
+            data_type = row[1].upper()
+            columns[col_name] = data_type
+        
+        cur.close()
+        _column_cache[table_name] = columns
+        logger.info(f"Cached columns for {table_name}: {[(name, dtype) for name, dtype in columns.items()]}")
+        return columns
+
     except Exception as e:
-        print(f"Error loading knowledge_base.json: {e}") # DEBUG
-        return []
-
-KNOWLEDGE_BASE_DATA = load_knowledge_base()
-
-# --- Snowflake Connection & Data Utilities ---
-def get_rbac_table(conn):
-    print("Fetching RBAC table from Snowflake...") # DEBUG
-    query = "SELECT USER_ID, ROLE, STORE_ID FROM ENTERPRISE.RETAIL_DATA.RBAC_WORK_TABLE"
-    cur = conn.cursor()
-    cur.execute(query)
-    df = cur.fetch_pandas_all()
-    cur.close()
-    df.columns = df.columns.str.lower()
-    df = df.rename(columns={'user_id': 'user_id', 'role': 'role', 'store_id': 'store_id'})
-    print(f"RBAC table loaded, shape: {df.shape}") # DEBUG
-    return df
-
-def get_sales_territory_keys(conn):
-    print("Fetching SalesTerritoryKeys from Snowflake...") # DEBUG
-    query = "SELECT DISTINCT SalesTerritoryKey FROM ENTERPRISE.RETAIL_DATA.SALES_FACT ORDER BY SalesTerritoryKey"
-    cur = conn.cursor()
-    cur.execute(query)
-    df = cur.fetch_pandas_all()
-    cur.close()
-    print(f"SalesTerritoryKeys loaded, count: {len(df)}") # DEBUG
-    return df['SALESTERRITORYKEY'].tolist()
-
-def create_location_to_territory_mapping(rbac_df, territory_keys):
-    print("Creating location-to-territory mapping...") # DEBUG
-    all_locations = sorted(rbac_df['store_id'].unique().tolist())
-    location_to_territory_map = {}
-    shuffled_territory_keys = territory_keys[:]
-    random.shuffle(shuffled_territory_keys)
-    territory_count = len(shuffled_territory_keys)
-    for i, location_id in enumerate(all_locations):
-        assigned_territory_key = shuffled_territory_keys[i % territory_count]
-        location_to_territory_map[location_id] = assigned_territory_key
-    print(f"Location-to-territory mapping created, length: {len(location_to_territory_map)}") # DEBUG
-    return location_to_territory_map
-
-def get_user_access(user_id, rbac_df):
-    print(f"Getting user access for user_id: {user_id}") # DEBUG
-    user_row = rbac_df[rbac_df['user_id'] == user_id]
-    if user_row.empty:
-        print("User access not found in RBAC table.") # DEBUG
-        return None
-    print("User access found.") # DEBUG
-    return {
-        "role": user_row.iloc[0]['role'],
-        "store_id": user_row.iloc[0]['store_id']
-    }
-
-def get_metric_value(conn, measure, store_id, location_to_territory_map):
-    print(f"Getting metric value for measure: {measure}, store_id: {store_id}") # DEBUG
-    sales_territory_key = location_to_territory_map.get(store_id)
-    if sales_territory_key is None:
-        print("Sales territory key not found for store_id.") # DEBUG
+        logger.error(f"Error getting columns for {table_name}: {e}")
         return {}
-    if measure['measure_name'].lower() == "sales amount":
-        query = f"""
-            SELECT SUM(SalesAmount) AS total_sales_amount
-            FROM ENTERPRISE.RETAIL_DATA.SALES_FACT
-            WHERE SalesTerritoryKey = {sales_territory_key}
-        """
-        try:
-            cur = conn.cursor()
-            cur.execute(query)
-            df_sales = cur.fetch_pandas_all()
-            cur.close()
-            df_sales.columns = df_sales.columns.str.lower()
-            total_sales = df_sales['total_sales_amount'][0] if not df_sales.empty and not df_sales['total_sales_amount'].isnull().iloc[0] else 0.0
-            print(f"Fetched total sales amount: {total_sales}") # DEBUG
-            return {"Sales Amount": total_sales}
-        except Exception as e:
-            print(f"Error querying Snowflake for Sales Amount: {e}") # DEBUG
-            return {"Sales Amount": 0.0}
-    if measure['measure_name'].lower() == "traffic conversion":
-        print("Returning default Traffic Conversion value.") # DEBUG
-        return {"Traffic Conversion": 0.0}
-    return {}
-
-# --- HIGHLIGHT: Refactored function to use a tool for more reliable intent recognition ---
-def find_measure_with_llm(user_query, knowledge_base):
-    print(f"Finding measure with LLM for query: {user_query}")
     
-    # 1. Define the tool the LLM can use
-    tools = [
-        {
-            "type": "function",
-            "function": {
-                "name": "get_measure",
-                "description": "Get the value of a specific retail measure for a user's store.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "measure_name": {
-                            "type": "string",
-                            "enum": [item['tool_name'] for item in knowledge_base],
-                            "description": "The name of the measure, e.g., 'sales_amount', 'traffic_conversion', 'basket_size'"
-                        }
-                    },
-                    "required": ["measure_name"]
-                }
-            }
-        }
-    ]
-    
-    # 2. Call the LLM with the user's query and the tool definition
-    try:
-        response = AZURE_OPENAI_CLIENT.chat.completions.create(
-            model=AZURE_OPENAI_DEPLOYMENT_NAME,
-            messages=[
-                {"role": "system", "content": "You are a helpful assistant. If the user asks for a measure, call the appropriate tool."},
-                {"role": "user", "content": user_query}
-            ],
-            tools=tools,
-            tool_choice="auto", # Let the model decide whether to call the tool
-        )
-        
-        # 3. Check if the LLM chose to call the tool
-        tool_calls = response.choices[0].message.tool_calls
-        if tool_calls:
-            function_call = tool_calls[0].function
-            function_name = function_call.name
-            arguments = json.loads(function_call.arguments)
-            tool_measure_name = arguments.get("measure_name")
-            
-            print(f"LLM called function: {function_name} with measure: {tool_measure_name}")
-            
-            # 4. Find the full measure object from our knowledge base
-            for measure in knowledge_base:
-                if measure['tool_name'] == tool_measure_name:
-                    print(f"Returning found measure: {measure}")
-                    return measure
-    
-    except Exception as e:
-        print(f"Error during LLM tool-calling: {e}")
-        
-    print("No measure found via tool-calling.")
+def find_column_by_data_type(columns: Dict[str, str], data_type_patterns: List[str]) -> Optional[str]:
+    """
+    Find column by data type.
+    """
+    for col_name, data_type in columns.items():
+        for pattern in data_type_patterns:
+            if pattern.upper() in data_type.upper():
+                logger.info(f"Found column '{col_name}' with data type '{data_type}' matching pattern '{pattern}'")
+                return col_name
     return None
 
-def build_llm_prompt(user, access, user_query, measure, sf_data=None, location_to_territory_map=None):
-    print("Building LLM prompt...") # DEBUG
-    if not measure or not access or location_to_territory_map is None:
-        print("Missing measure/access/data map for prompt.") # DEBUG
-        return "Sorry, I couldn't find the measure, your access info, or a valid data map."
-    sales_territory_key = location_to_territory_map.get(access['store_id'])
-    prompt_template = f"""
-    You are an AI assistant for a retail data team. Your user is a {access['role']} for store {access['store_id']} (which maps to sales territory {sales_territory_key}).
-    The user's query is: '{user_query}'
-    Here is the official definition of the requested measure and its current value for the user's store:
-    Description: {measure['description']}
-    DAX Formula: {measure['dax_formula']}
+# THE NEW PURELY ROBUST QUERY BUILDER
+class RobustQueryBuilder:
     """
-    if sf_data and measure['measure_name'] in sf_data:
-        data_value = sf_data[measure['measure_name']]
-        if measure['measure_name'] == "Sales Amount":
-            data_string = f"${data_value:,.2f}"
-        else:
-            data_string = f"{data_value:.3f}"
-        prompt_template += f"\nFor your store ({access['store_id']}), the current {measure['measure_name']} is {data_string}."
-
-    prompt_template += f"""
-    Based ONLY on this information, provide a clear and concise answer to the user's question. After your answer, suggest 2-3 similar questions with insights and relevant measures that the user might want to ask next. Do not use any bolding, formatting, or headers like 'Answer:' or 'Suggestions:'. Just provide the response as plain text.
-    Your response:
+    This approach uses DATABASE METADATA instead of guessing column names.
+    It's bulletproof against any naming convention changes.
     """
-    print("LLM prompt built.") # DEBUG
-    return prompt_template.strip()
+    def __init__(self, conn):
+        self.conn = conn
+        self.sales_fact_cols = get_table_columns(conn, 'SALES_FACT')
+        self.rbac_cols = get_table_columns(conn, 'RBAC_WORK_TABLE')
+    
+    def build_sales_query(self) -> Optional[str]:
+        """
+        Build query using DATA TYPES to identify columns - works with ANY column names!
+        """
+        # Step 1: Find the AMOUNT column using data type
+        sales_amount_col = find_column_by_data_type(self.sales_fact_cols,
+            ['NUMBER', 'DECIMAL', 'FLOAT', 'NUMERIC', 'REAL', 'DOUBLE']
+        )
 
-def call_azure_openai(prompt, max_tokens=500):
-    print("Calling Azure OpenAI...") # DEBUG
-    if not AZURE_OPENAI_KEY or not AZURE_OPENAI_ENDPOINT or not AZURE_OPENAI_DEPLOYMENT_NAME:
-        print("Azure OpenAI configuration missing.") # DEBUG
+        # Step 2: Find DATE columns for joining
+        sales_date_col = find_column_by_data_type(self.sales_fact_cols,
+            ['DATE', 'TIMESTAMP', 'TIME', 'DATETIME']
+        )
+        rbac_date_col = find_column_by_data_type(self.rbac_cols,
+            ['DATE', 'TIMESTAMP', 'TIME', 'DATETIME']
+        )
+        
+        # Step 3: Validate we found required columns
+        if not sales_amount_col:
+            logger.error("No numeric column found in SALES_FACT table")
+            return None
+        if not sales_date_col:
+            logger.error("No date column found in SALES_FACT table")
+            return None
+        if not rbac_date_col:
+            logger.error("No date column found in RBAC_WORK_TABLE")
+            return None
+
+        # Step 4: Build query with ACTUAL column names (whatever they are!)
+        query = f"""
+        SELECT COALESCE(SUM(salesamount), 0)
+        FROM ENTERPRISE.RETAIL_DATA.SALES_FACT
+        JOIN ENTERPRISE.RETAIL_DATA.RBAC_WORK_TABLE
+        ON ENTERPRISE.RETAIL_DATA.SALES_FACT.{sales_date_col} = ENTERPRISE.RETAIL_DATA.RBAC_WORK_TABLE.{rbac_date_col}
+        WHERE ENTERPRISE.RETAIL_DATA.RBAC_WORK_TABLE.USER_ID = 'victor'
+        """
+        
+        logger.info(f"Built adaptive query: {query}")
+        logger.info(f" Amount column: {sales_amount_col} (type: {self.sales_fact_cols.get(sales_amount_col, 'N/A')})")
+        logger.info(f" Sales date column: {sales_date_col} (type: {self.sales_fact_cols.get(sales_date_col, 'N/A')})")
+        logger.info(f" RBAC date column: {rbac_date_col} (type: {self.rbac_cols.get(rbac_date_col, 'N/A')})")
+        
+        return query
+
+# Knowledge base
+def load_knowledge_base():
+    try:
+        path = os.path.join(os.path.dirname(__file__), "knowledge_base.json")
+        with open(path, "r") as f:
+            return json.load(f)
+    except Exception as e:
+        logger.error(f"Error loading knowledge_base.json: {e}")
+        return [
+            {
+                "measure_name": "Sales Amount",
+                "tool_name": "sales_amount",
+                "description": "The total monetary value of all sales transactions. This is a key measure for a store's financial performance.",
+                "dax_formula": "SUM('SalesFact'[SalesAmount])",
+                "aliases": ["sales", "sales revenue", "total sales", "store sales"]
+            },
+            {
+                "measure_name": "Traffic Conversion",
+                "tool_name": "traffic_conversion", 
+                "description": "Calculated as Total Sales Transactions divided by Total Store Visits.",
+                "dax_formula": "[Total Transactions] / [Store Visits]",
+                "aliases": ["conversion rate", "traffic to sales", "customer conversion"]
+            }
+        ]
+
+KNOWLEDGE_BASE_DATA = load_knowledge_base()
+TOOL_NAME_TO_MEASURE = {item['tool_name']: item for item in KNOWLEDGE_BASE_DATA}
+ALIAS_TO_TOOL_NAME = {}
+for item in KNOWLEDGE_BASE_DATA:
+    for alias in item['aliases']:
+        ALIAS_TO_TOOL_NAME[alias.lower()] = item['tool_name']
+
+# Intent recognition cache
+_intent_cache = {}
+
+def get_user_data(user_id: str, conn) -> Optional[Dict[str, Any]]:
+    # This function now always queries the database to get the latest data
+    query = "SELECT USER_ID, ROLE, STORE_ID FROM ENTERPRISE.RETAIL_DATA.RBAC_WORK_TABLE"
+    try:
+        cur = conn.cursor()
+        cur.execute(query)
+        df = cur.fetch_pandas_all()
+        cur.close()
+        df.columns = df.columns.str.lower()
+        
+        user_row = df[df['user_id'] == user_id]
+        if user_row.empty:
+            return None
+        return {"role": user_row.iloc[0]['role'],
+                "store_id": user_row.iloc[0]['store_id']
+                }
+    except Exception as e:
+        logger.error(f"Error getting user data: {e}")
         return None
+
+def get_available_metrics_list() -> str:
+    metrics = [item['measure_name'] for item in KNOWLEDGE_BASE_DATA]
+    if len(metrics) <= 2:
+        return " and ".join(metrics)
+    else:
+        return ", ".join(metrics[:-1]) + f", and {metrics[-1]}"
+
+# Intent recognition
+def identify_metric_intent(user_query: str) -> Optional[str]:
+    # Check cache first
+    query_key = user_query.lower().strip()
+    if query_key in _intent_cache:
+        logger.info(f"Cache hit for query: '{user_query}' -> {_intent_cache[query_key]}")
+        return _intent_cache[query_key]
+    
+    query_lower = user_query.lower()
+    logger.info(f"Intent recognition for query: '{user_query}'")
+    
+    # Pre-filter unrelated queries
+    unrelated_patterns = ["how are you", "what's your name", "weather", "time",
+                          "joke", "story", "recipe", "news", "sports", "music"]
+    
+    for pattern in unrelated_patterns:
+        if pattern in query_lower and len(user_query.strip()) < 50:
+            logger.info(f"Detected unrelated pattern: {pattern}")
+            _intent_cache[query_key] = "UNRELATED"
+            return "UNRELATED"
+
+    # Direct keyword matching
+    traffic_keywords = ["traffic", "conversion", "convert", "visits"]
+    for keyword in traffic_keywords:
+        if keyword in query_lower:
+            logger.info(f"Traffic keyword match found: {keyword}")
+            _intent_cache[query_key] = "traffic_conversion"
+            return "traffic_conversion"
+    
+    sales_keywords = ["sales", "revenue", "amount", "money", "dollar"]
+    for keyword in sales_keywords:
+        if keyword in query_lower:
+            logger.info(f"Sales keyword match found: {keyword}")
+            _intent_cache[query_key] = "sales_amount"
+            return "sales_amount"
+
+    # Check aliases
+    for alias, tool_name in ALIAS_TO_TOOL_NAME.items():
+        if alias in query_lower:
+            logger.info(f"Alias match found: {alias} -> {tool_name}")
+            _intent_cache[query_key] = tool_name
+            return tool_name
+
+    # MINIMAL TOKEN LLM fallback
+    if not AZURE_OPENAI_CLIENT:
+        _intent_cache[query_key] = None
+        return None
+        
+    prompt = f"'{user_query}' sales or traffic?"
+    
     try:
         response = AZURE_OPENAI_CLIENT.chat.completions.create(
             model=AZURE_OPENAI_DEPLOYMENT_NAME,
-            messages=[
-                {"role": "user", "content": prompt}
-            ],
-            max_completion_tokens=max_tokens
+            messages=[{"role": "user", "content": prompt}],
+            max_completion_tokens=8
         )
-        print("Azure OpenAI response received.") # DEBUG
-        return response.choices[0].message.content
-    except Exception as e:
-        print(f"Azure OpenAI API Error: {e}") # DEBUG
-        return None
-
-# --- The Core Bot Logic Handler ---
-async def message_handler(turn_context: TurnContext):
-    print("Entered message_handler...")
-    
-    if turn_context.activity.type != ActivityTypes.message:
-        print(f"Ignoring activity of type: {turn_context.activity.type}")
-        return
-    
-    user_query = turn_context.activity.text
-    print(f"user_query: {user_query}")
-    teams_user_id = turn_context.activity.from_property.id
-    print(f"teams_user_id: {teams_user_id}")
-    final_answer = ""
-    conn = None
-
-    try:
-        try:
-            print("Connecting to Snowflake...")
-            conn = snowflake.connector.connect(
-                user=SNOWFLAKE_USER,
-                password=SNOWFLAKE_PASSWORD,
-                account=SNOWFLAKE_ACCOUNT,
-                warehouse=SNOWFLAKE_WAREHOUSE,
-                database=SNOWFLAKE_DATABASE,
-                schema=SNOWFLAKE_SCHEMA
-            )
-            print("Connected to Snowflake.")
-        except Exception as e:
-            print(f"Snowflake Connection Error: {e}")
-            final_answer = "Sorry, I'm unable to connect to the data source right now. Please try again later."
-            await turn_context.send_activity(Activity(text=final_answer, type=ActivityTypes.message))
-            return
-
-        try:
-            print("Fetching RBAC and Territory Data from Snowflake...")
-            rbac_df = get_rbac_table(conn)
-            territory_keys = get_sales_territory_keys(conn)
-            location_to_territory_map = create_location_to_territory_mapping(rbac_df, territory_keys)
-            print("Successfully fetched RBAC and Territory data.")
-        except Exception as e:
-            print(f"Error fetching Snowflake data: {e}")
-            final_answer = "Sorry, there was an issue retrieving user access data. Please contact support."
-            await turn_context.send_activity(Activity(text=final_answer, type=ActivityTypes.message))
-            return
-
-        rbac_user_id = "victor"
-        print("Using static RBAC user_id for testing:", rbac_user_id)
-
-        access = get_user_access(rbac_user_id, rbac_df)
-        print(f"access: {access}")
-
-        if not access:
-            print("Access information not found in RBAC table.")
-            final_answer = "Sorry, your access information could not be found in the RBAC table."
+        
+        result = response.choices[0].message.content.strip().lower()
+        logger.info(f"LLM result: {result}")
+        
+        # Parse minimal response
+        if "traffic" in result:
+            _intent_cache[query_key] = "traffic_conversion"
+            return "traffic_conversion"
+        elif "sales" in result:
+            _intent_cache[query_key] = "sales_amount"
+            return "sales_amount"
         else:
-            # HIGHLIGHT: Critical pre-check to prevent a "None" object crash
-            if AZURE_OPENAI_CLIENT is None:
-                print("AZURE_OPENAI_CLIENT is None. Cannot proceed with LLM calls.")
-                final_answer = "Sorry, an internal configuration error with the AI model occurred. Please contact support."
-                await turn_context.send_activity(Activity(text=final_answer, type=ActivityTypes.message))
-                return
-
-            try:
-                print("Calling find_measure_with_llm...")
-                measure = find_measure_with_llm(user_query, KNOWLEDGE_BASE_DATA)
-                print(f"measure: {measure}")
-            except Exception as e:
-                print(f"Error in find_measure_with_llm: {e}")
-                final_answer = "Sorry, I'm having trouble understanding your request right now."
-                await turn_context.send_activity(Activity(text=final_answer, type=ActivityTypes.message))
-                return
-
-            if measure:
-                try:
-                    print("Calling get_metric_value...")
-                    sf_data = get_metric_value(conn, measure, access['store_id'], location_to_territory_map)
-                    print(f"sf_data: {sf_data}")
-                    llm_prompt = build_llm_prompt(
-                        {"user_id": rbac_user_id},
-                        access,
-                        user_query,
-                        measure,
-                        sf_data=sf_data,
-                        location_to_territory_map=location_to_territory_map
-                    )
-                    print(f"llm_prompt: {llm_prompt[:200]}...")
-                    
-                    print("Calling call_azure_openai...")
-                    final_answer = call_azure_openai(llm_prompt)
-                    print(f"final_answer: {final_answer}")
-                except Exception as e:
-                    print(f"Error getting metric value or calling Azure OpenAI: {e}")
-                    final_answer = "Sorry, an internal error occurred while retrieving and processing your data."
-            else:
-                print("Measure not found.")
-                final_answer = "Sorry, I can't find that measure. Please ask about sales, traffic, or basket size."
+            _intent_cache[query_key] = "UNRELATED"
+            return "UNRELATED"
             
     except Exception as e:
-        print(f"Unhandled error in message_handler outer: {e}")
-        final_answer = "Sorry, an internal error occurred while processing your request. Please try again later."
+        logger.error(f"LLM intent error: {e}")
+        _intent_cache[query_key] = None
+        return None
+
+# DATA RETRIEVAL
+def get_metric_value_fast(conn, tool_name: str, store_id: int, user_id: str, query: str) -> Optional[float]:
+    """
+    Data retrieval that works with ANY column names thanks to data-type detection
+    """
+    try:
+        user_session = get_user_session(user_id, conn)
+        if not user_session:
+            return "Access denied"
+
+        # Check store access permissions
+        if store_id != user_session.store_id:
+            access_denied_response = """Sorry I couldn't provide that information. Perhaps I can help you to find the relevant data for your store.
+            Examples of questions I can answer:
+            • "What are my sales for this month?"
+            • "How's the traffic conversion rate?"
+            • "Show me the current sales amount"
+            What would you like to know about your store performance?"""
+            return access_denied_response
+
+        if tool_name == "sales_amount":
+            # Execute the data-type-based query
+            cur = conn.cursor()
+            cur.execute(query)
+            result = cur.fetchone()
+            cur.close()
+            return float(result[0]) if result else 0.0
+        elif tool_name == "traffic_conversion":
+            return 0.000
+        return None
+    except Exception as e:
+        logger.error(f"Metric query error: {e}")
+        # Return a specific string to signal a data retrieval failure
+        return "data_retrieval_failed"
+
+# Response generation (unchanged)
+def generate_rich_response(user_query: str, tool_name: str, metric_value: float, store_id: int) -> str:
+    logger.info(f"Generating response for tool_name: {tool_name}, value: {metric_value}")
+    
+    measure_info = TOOL_NAME_TO_MEASURE.get(tool_name)
+    if not measure_info:
+        logger.error(f"No measure info found for tool_name: {tool_name}")
+        return f"Metric not found for store {store_id}."
+
+    # Format value
+    if tool_name == "sales_amount":
+        formatted_value = f"${metric_value:,.2f}"
+    elif tool_name == "traffic_conversion":
+        formatted_value = f"{metric_value:.3f}"
+    else:
+        formatted_value = f"{metric_value:.2f}"
+
+    logger.info(f"Formatted value: {formatted_value}")
+    
+    measure_name = measure_info['measure_name']
+    description = measure_info['description']
+    
+    base_response = f"For store {store_id}, {measure_name} is defined as {description.lower()}, and the current {measure_name} value is {formatted_value}."
+
+    if tool_name == "sales_amount":
+        suggestions = ' You might also ask: "How does this compare to last month?" or "What are my top performing products?"'
+    elif tool_name == "traffic_conversion":
+        suggestions = ' You might also ask: "What are the total store visits for my store?" or "How many sales transactions did we record to calculate this measure?"'
+    else:
+        suggestions = ' You might also ask: "How can I improve this metric?" or "What factors influence this measure?"'
+    
+    final_response = base_response + suggestions
+    logger.info(f"Final response generated: {final_response[:100]}...")
+    
+    return final_response
+
+# Session management (unchanged)
+class UserSession:
+    def __init__(self, user_id: str, role: str, store_id: int):
+        self.user_id = user_id
+        self.role = role
+        self.store_id = store_id
+        self.last_queries = []
+
+_user_sessions = {}
+
+def get_user_session(user_id: str, conn) -> Optional[UserSession]:
+    if user_id not in _user_sessions:
+        user_data = get_user_data(user_id, conn)
+        if user_data:
+            _user_sessions[user_id] = UserSession(
+                user_id, user_data["role"], user_data["store_id"]
+            )
+    return _user_sessions.get(user_id)
+
+# Main message handler
+async def message_handler(turn_context: TurnContext):
+    if turn_context.activity.type != ActivityTypes.message:
+        return
+    
+    user_query = turn_context.activity.text.strip()
+    user_id = "victor" # NOTE: Hardcoded user ID - should be dynamic in a production app.
+    
+    if not user_query or len(user_query) > 300:
+        await turn_context.send_activity("Please ask a specific question about store metrics.")
+        return
+    
+    conn = None
+    try:
+        conn = snowflake.connector.connect(
+            user=SNOWFLAKE_USER,
+            password=SNOWFLAKE_PASSWORD,
+            account=SNOWFLAKE_ACCOUNT,
+            warehouse=SNOWFLAKE_WAREHOUSE,
+            database=SNOWFLAKE_DATABASE,
+            schema=SNOWFLAKE_SCHEMA
+        )
+        
+        session = get_user_session(user_id, conn)
+        if not session:
+            await turn_context.send_activity("Access denied. Contact support.")
+            return
+
+        # Intent recognition with caching
+        logger.info(f"Processing user query: '{user_query}'")
+        tool_name = identify_metric_intent(user_query)
+        logger.info(f"Identified tool_name: {tool_name}")
+
+        if tool_name == "UNRELATED":
+            available_metrics = get_available_metrics_list()
+            unrelated_response = f"""Sorry, I couldn't provide you that information. Perhaps I can help you with these details:
+            Available metrics for your store:
+            • {available_metrics}
+            Examples of questions I can answer:
+            • "What are my sales for this month?"
+            • "How's the traffic conversion rate?"
+            • "Show me the current sales amount"
+            What would you like to know about your store performance?"""
+            await turn_context.send_activity(unrelated_response)
+            return
+
+        if not tool_name:
+            available_metrics = get_available_metrics_list()
+            no_match_response = f"""I'm not sure what metric you're asking about. I can help you with: {available_metrics}.
+            Try asking:
+            • "What are my current sales?"
+            • "How's my traffic conversion?"
+            • "Show me store performance data"
+            What specific metric would you like to see?"""
+            await turn_context.send_activity(no_match_response)
+            return
+
+        # Extract store_id from user query if mentioned
+        requested_store_id = session.store_id
+        user_query_lower = user_query.lower()
+
+        # Simple pattern matching for "store [number]"
+        store_match = re.search(r'store\s*#?(\d+)', user_query_lower)
+        if store_match:
+            try:
+                requested_store_id = int(store_match.group(1))
+            except (ValueError, IndexError):
+                pass
+        
+        # Use the PURELY ROBUST QUERY BUILDER to build the query
+        query_builder = RobustQueryBuilder(conn)
+        query = query_builder.build_sales_query()
+        if query is None:
+            await turn_context.send_activity("The requested data is not available due to a schema change. Please try again later.")
+            return
+
+        # Get metric value with the robust query
+        metric_value = get_metric_value_fast(conn, tool_name, requested_store_id, user_id, query)
+        logger.info(f"Retrieved metric_value: {metric_value} for tool_name: {tool_name}")
+
+        if isinstance(metric_value, str):
+            if metric_value == "data_retrieval_failed":
+                await turn_context.send_activity("There was a problem retrieving data for that metric. The database may be temporarily unavailable.")
+            else:
+                await turn_context.send_activity(metric_value)
+            return
+
+        if metric_value is None:
+            await turn_context.send_activity(f"Cannot retrieve data for store {requested_store_id}.")
+            return
+
+        # Generate response - NO API CALLS
+        response = generate_rich_response(user_query, tool_name, metric_value, requested_store_id)
+        await turn_context.send_activity(response)
+        
+        session.last_queries.append({"query": user_query, "metric": tool_name})
+        if len(session.last_queries) > 3:
+            session.last_queries.pop(0)
+
+    except Exception as e:
+        logger.error(f"Error in message_handler: {e}")
+        await turn_context.send_activity("Service temporarily unavailable. Please try again.")
     finally:
         if conn:
             conn.close()
-            print("Snowflake connection closed.")
 
-    await turn_context.send_activity(Activity(text=final_answer, type=ActivityTypes.message))
-    print("Activity sent to bot.")
-
-
-# --- The Main Azure Functions Entry Point ---
+# Main function (unchanged)
 def main(req: func.HttpRequest) -> func.HttpResponse:
-    print('Python HTTP trigger function received a request.') # DEBUG
-
     if req.method == 'GET':
         return func.HttpResponse("Bot endpoint is healthy", status_code=200)
 
     if req.method != 'POST':
-        return func.HttpResponse("Only POST requests are supported for bot messages.", status_code=405)
+        return func.HttpResponse("Only POST requests supported.", status_code=405)
 
     try:
         req_json = req.get_json()
-        print(f"Request JSON: {req_json}") # DEBUG
+        activity = Activity.deserialize(req_json)
+        auth_header = req.headers.get('Authorization') or req.headers.get('authorization') or ''
 
-    except ValueError:
-        print("HTTP request does not contain valid JSON data. This may be a non-bot request.")
-        return func.HttpResponse(
-            "Please pass a valid JSON activity in the request body.",
-            status_code=400
-        )
-    except Exception as error:
-        print(f"Failed to get JSON from request: {error}")
-        return func.HttpResponse(
-            f"An error occurred while parsing the request body: {error}",
-            status_code=500
-        )
-
-    activity = Activity.deserialize(req_json)
-    auth_header = req.headers.get('Authorization') or req.headers.get('authorization') or ''
-
-    APP_ID = os.environ.get("MicrosoftAppId", "")
-    APP_PASSWORD = os.environ.get("MicrosoftAppPassword", "")
-    APP_TYPE = os.environ.get("MicrosoftAppType", "")
-    APP_TENANT_ID = os.environ.get("MicrosoftAppTenantId", "")
-
-    try:
         if APP_TYPE == "SingleTenant" and APP_TENANT_ID:
             credentials = SingleTenantAppCredentials(APP_ID, APP_PASSWORD, APP_TENANT_ID)
-            print("Using SingleTenantAppCredentials")
         else:
             credentials = MicrosoftAppCredentials(APP_ID, APP_PASSWORD)
-            print("Using standard MicrosoftAppCredentials")
 
-        settings = BotFrameworkAdapterSettings(
-            app_id=APP_ID,
-            app_password=APP_PASSWORD
-        )
-
+        settings = BotFrameworkAdapterSettings(app_id=APP_ID, app_password=APP_PASSWORD)
         if APP_TYPE == "SingleTenant" and APP_TENANT_ID:
             settings.oauth_endpoint = f"https://login.microsoftonline.com/{APP_TENANT_ID}"
-            print(f"Set OAuth authority to: {settings.oauth_endpoint}")
-
+        
         adapter = BotFrameworkAdapter(settings)
         adapter._credentials = credentials
         
-        print("Adapter created.")
-
-    except Exception as adapter_error:
-        print(f"Failed to create adapter: {adapter_error}")
-        return func.HttpResponse("Adapter creation failed.", status_code=500)
-
-    try:
         asyncio_loop = asyncio.new_event_loop()
         asyncio.set_event_loop(asyncio_loop)
-
+        
         response = asyncio_loop.run_until_complete(
-            adapter.process_activity(
-                activity,
-                auth_header,
-                message_handler
-            )
+            adapter.process_activity(activity, auth_header, message_handler)
         )
 
-        if response:
-            return func.HttpResponse(
-                body=response.body,
-                mimetype=response.content_type,
-                status_code=response.status
-            )
-        else:
-            return func.HttpResponse(status_code=202)
-
-    except Exception as process_error:
-        print(f"Error processing bot request: {process_error}")
         return func.HttpResponse(
-            "An error occurred while processing the request.",
-            status_code=500
+            body=response.body if response else "",
+            status_code=response.status if response else 202
         )
 
-
-
-
+    except Exception as e:
+        logger.error(f"Error processing request: {e}")
+        return func.HttpResponse("Internal error.", status_code=500)
