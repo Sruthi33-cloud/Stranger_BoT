@@ -137,7 +137,7 @@ class RobustQueryBuilder:
         DB_SCHEMA_SALES = f"{SNOWFLAKE_DATABASE}.{SNOWFLAKE_SCHEMA}.SALES_FACT"
         DB_SCHEMA_RBAC = f"{SNOWFLAKE_DATABASE}.{SNOWFLAKE_SCHEMA}.RBAC_WORK_TABLE"
         query = f"""
-        SELECT COALESCE(SUM(t1.{sales_amount_col}), 0) 
+        SELECT COALESCE(SUM(t1.salesamount), 0) 
         FROM {DB_SCHEMA_SALES} t1
         JOIN {DB_SCHEMA_RBAC} t2
         ON t1.{sales_date_col} = t2.{rbac_date_col}
@@ -479,4 +479,5 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
         print(traceback.format_exc())
         flush_log("Error processing request in main - see printed traceback above.")
         return func.HttpResponse("Internal server error during request processing.", status_code=500)
+
 
