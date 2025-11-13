@@ -182,7 +182,7 @@ for item in KNOWLEDGE_BASE_DATA:
 _intent_cache = {}
 
 def get_user_data(user_id: str, conn) -> Optional[Dict[str, Any]]:
-    query = f"SELECT USER_ID, ROLE, STORE_ID FROM {SNOWFLAKE_DATABASE}.{SNOWFLAKE_SCHEMA}.RBAC_WORK_TABLE WHERE USER_ID = '{user_id.upper()}'"
+    query = f"SELECT USER_ID, ROLE, STORE_ID FROM {SNOWFLAKE_DATABASE}.{SNOWFLAKE_SCHEMA}.RBAC_WORK_TABLE WHERE USER_ID = '{user_id}'"
     try:
         cur = conn.cursor()
         cur.execute(query)
@@ -479,3 +479,4 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
         print(traceback.format_exc())
         flush_log("Error processing request in main - see printed traceback above.")
         return func.HttpResponse("Internal server error during request processing.", status_code=500)
+
